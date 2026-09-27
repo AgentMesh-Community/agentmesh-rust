@@ -1,0 +1,26 @@
+{
+  "expect_payload": {
+    "n": 42,
+    "nested": {
+      "list": [
+        1,
+        2,
+        3
+      ],
+      "ok": true
+    },
+    "text": "cross-impl pairwise subject",
+    "unicode": "héllo → 🌍"
+  },
+  "note": "Sealed by the Rust SDK for the TypeScript cross-check. Test vectors only.",
+  "recipient_public": "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9_AsrhtHHw",
+  "recipient_secret": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+  "reply_key": "ja_P7q6QRe6aeNeKmfzzLneB5EHrBzCWw0K44tzDthI",
+  "sealed": {
+    "ct": "AUNFaNAF7cA6G8DyhTnIfXarcVSj_cZosIEdC6zMrHjzC16jLosDTJ73SpLQP3E666F8uA6ziiQ7w_FtpUtgKOUZW9dozd36POCTRVCwZLjjmOzpdR-_GjPQI9P9RVfgGVagsZTZ8dpGQUJlINha-h64Ru1dMas9F2ZhVos",
+    "epk": "P1LRdnPG47eHqgu6zCkRWgimkrpUbNTgWSAvUfUuZjk",
+    "nonce": "BBktARC_PDZu93-iBsoGyDsU105Zm8yw",
+    "reply_key": "ja_P7q6QRe6aeNeKmfzzLneB5EHrBzCWw0K44tzDthI",
+    "v": "sealedpayload.v1"
+  }
+}

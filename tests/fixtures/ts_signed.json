@@ -1,0 +1,27 @@
+{
+  "v": "0.3.0",
+  "id": "01a01075-4bd5-7000-aaca-713882f7376e",
+  "type": "request",
+  "ts": "2026-08-17T16:01:57.717Z",
+  "from": "UDXI5W3GIPRUIF3FMYRTQUTDIJRYKXONZUETKDH2HNINC4PQHWIRS5SI",
+  "trace": {
+    "trace_id": "68797cb3586fffa188a044ccb3f58af0",
+    "span_id": "c228e3d8d2e7a57c",
+    "parent_span_id": null
+  },
+  "to": "UDEST",
+  "payload": {
+    "z": 1,
+    "a": "héllo/世界",
+    "nested": {
+      "b": true,
+      "arr": [
+        3,
+        2,
+        1
+      ],
+      "n": null
+    }
+  },
+  "sig": "MYHCA4bmG5Bf9whnimLBEep4Ds_HjauLmxJZn62cdoHu3OL0qSc5BG7_46z2N3k8Kf8TH1pXiVtS05YhQ4FZBg"
+}

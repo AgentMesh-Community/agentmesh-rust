@@ -1,0 +1,61 @@
+[package]
+name = "agentmesh"
+version = "0.20.0"
+edition = "2021"
+description = "Rust SDK for AgentMesh: signed agent-to-agent messaging over NATS"
+license = "Apache-2.0"
+homepage = "https://agentmesh.ai"
+documentation = "https://dev.agentmesh.ai/spec.html"
+repository = "https://github.com/AgentMesh-Community/agentmesh-rust"
+readme = "README.md"
+
+[features]
+# ON by default, and the reason is parity rather than convenience. A §4.8 node
+# credential expires, and a host that cannot renew it loses its connection —
+# so "renewal works out of the box" is the behaviour the TypeScript SDK has and
+# this one must have too. Leaving it off by default would mean a Rust embedder
+# writes its own HTTP glue, its own timeout, and its own request body, and the
+# first symptom of getting the last one wrong is an agent that cannot renew.
+#
+# Turn it off (`default-features = false`) if you are embedding in a
+# constrained target, already carry an HTTP client, or have opinions about TLS
+# roots and proxies that a default cannot honour. Then supply your own
+# `CredentialTransport`; that trait is unchanged and is the supported path.
+default = ["http"]
+http = ["dep:reqwest"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: parse floats to the mathematically nearest double, the same
+# result JavaScript's JSON.parse produces. Without it a parsed exotic float can
+# be one ULP off the TS SDK's value, which canonical JSON then serializes as
+# different bytes — a cross-SDK signature failure before serialization even runs.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# RFC 8785 (JCS) serializer: ECMAScript number formatting (via ryu-js), UTF-16
+# code unit key sort, minimal escaping. canonical_json (SPEC.md 5.3) delegates
+# to it; evaluated against RFC 8785 Appendix B before adoption (2026-07-27).
+serde_jcs = "0.2"
+nkeys = "0.4"
+base64 = "0.22"
+uuid = { version = "1", features = ["v7"] }
+rand = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+thiserror = "1"
+async-nats = { version = "0.42", features = ["websockets"] }  # 0.42+: wss port defaults via port_or_known_default (0.38 mis-defaulted to 4222)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+futures = "0.3"
+# Sealed-grade rooms (§7.3), NaCl-compatible with the TS SDK's tweetnacl:
+# X25519 + XSalsa20-Poly1305 (crypto_box = NaCl box; crypto_secretbox = NaCl
+# secretbox), SHA-512 for the room-key fingerprint.
+crypto_box = { version = "0.9", features = ["salsa20", "std"] }
+crypto_secretbox = { version = "0.1", features = ["std"] }
+sha2 = "0.10"
+# The built-in `CredentialTransport` (feature `http`, on by default): the one
+# POST §4.8 renewal makes. rustls rather than the platform TLS stack so a build
+# needs no system OpenSSL, and default features off so this brings a TLS client
+# and nothing else — no cookies, no blocking client, no charset guessing (the
+# body is read as bytes and decoded as UTF-8 here).
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "http2"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

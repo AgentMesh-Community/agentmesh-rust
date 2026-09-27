@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: cargo check, cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show the toolchain
+        run: cargo --version && rustc --version
+      # Downloaded crates only, not target/: a cached target/ grows without end.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+      - name: cargo check
+        run: cargo check --all-targets
+      - name: cargo test
+        # The suites that need a live NATS server skip when NATS_URL is unset.
+        run: cargo test
