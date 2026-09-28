@@ -238,3 +238,13 @@ pub fn subscription_hash(pattern: &str) -> String {
 pub fn event_durable(agent_id: &str, pattern: &str) -> String {
     format!("mesh_event_{agent_id}_{}", subscription_hash(pattern))
 }
+
+/// An agent's durable feed consumer on [`FEED_STREAM`] (§18.6 Feed Consumer):
+/// ONE per agent, `mesh_feed_{agent_id}`, whose filter subjects are the feeds
+/// it follows durably. Named for the agent and not the feed because a
+/// credential can grant a consumer only by its whole name, and the agent's key
+/// is the one name known when the credential is minted. Cross-SDK contract:
+/// the TypeScript SDK's `Subjects.feedConsumer` spells it identically.
+pub fn feed_consumer(agent_id: &str) -> String {
+    format!("mesh_feed_{agent_id}")
+}

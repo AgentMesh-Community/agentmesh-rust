@@ -61,7 +61,11 @@
 //! §22 pipeline as events (handing the handler the full payload — a feed's
 //! identity travels in-band), the §18.3 current-value read on
 //! `mesh.feed.get`, subscribe-before-snapshot tracking (§9.6), and the
-//! manifest `emits` declaration at register — see [`feed`]. Callers holding a
+//! manifest `emits` declaration at register, see [`feed`]. **Durable feed
+//! subscriptions** (§18.6 Feed Consumer) add a followed feed to the agent's one
+//! `mesh_feed_{agent}` pull consumer on `MESH_FEED`, so what was published
+//! while it was offline arrives when it returns, see
+//! [`client::AgentMesh::subscribe_feed_durable`]. Callers holding a
 //! manifest address its carried `endpoints` verbatim rather than constructing
 //! subjects (§14.4).
 //! **§19.1 SKUs and §19.5 agreements** are implemented end to end: SKUs
@@ -120,6 +124,7 @@ pub mod node;
 pub mod preflight;
 pub mod presence;
 pub mod rests_on;
+pub mod revoked_senders;
 pub mod rooms;
 pub mod sealed;
 pub mod sealing;
@@ -177,7 +182,7 @@ pub use credential::default_credential_transport;
 pub use credential::HttpCredentialTransport;
 pub use envelope::{Envelope, PrimitiveType, TraceContext, PROTOCOL_VERSION};
 pub use error::{ErrorCode, ErrorObject, MeshError, Result};
-pub use feed::{feed_lookup_payload, feed_payload, FeedKind};
+pub use feed::{feed_lookup_payload, feed_payload, DurableFeedSubscription, FeedKind};
 pub use inbound::{
     addressed_to_me, admit_envelope, fence_inbound_input, fence_sender_text, frame_message,
     fresh_enough, inbound_text_length, is_sealed_payload, now_ms, over_inbound_cap, parse_instant_ms,

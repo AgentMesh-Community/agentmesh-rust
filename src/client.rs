@@ -42,6 +42,7 @@ use crate::inbound::{
 };
 use crate::manifest::{Manifest, NodeRef, Offering, PublicBlock};
 use crate::sku::{public_sku_of, sku_digest, sku_for, validate_skus, Sku, SkuPriceModel};
+use crate::revoked_senders::{RevocationAnswer, RevokedSenders};
 use crate::subjects;
 use crate::util::child_span;
 use crate::vouch::{
@@ -916,6 +917,11 @@ struct Inner {
     /// watch all land here, so `task_budget` is always the highest revision
     /// seen — the whole truth, per §7.7.
     task_budgets: TaskBudgets,
+    /// §5.3: senders whose key the registry says is revoked, or who are
+    /// paused, are refused before their request is handled
+    /// ([`crate::revoked_senders`]). Consulted only while
+    /// [`InboundOptions::refuse_revoked_senders`] is on.
+    revoked_senders: RevokedSenders,
     /// §10.8 propagation basis: parent task id → the still-live sub-requests
     /// its handler issued. "Still live" IS presence in this map — an entry is
     /// recorded when a sub-request inside a dispatched handler comes back
@@ -999,6 +1005,10 @@ struct Inner {
     /// is byte-stable. Declared via [`AgentMesh::declare_feed`]; read by
     /// `build_manifest`.
     declared_feeds: std::sync::Mutex<std::collections::BTreeMap<String, crate::feed::FeedKind>>,
+    /// The §18.6 Feed Consumer's one pull loop and its handlers, shared by
+    /// every durable feed subscription of this agent
+    /// ([`AgentMesh::subscribe_feed_durable`]).
+    feed_durable: Arc<crate::feed::FeedDurableShared>,
     /// The naming rule ([`crate::naming_gate`]): set when the agent connected
     /// with `require_named`, and then every send this agent originates asks it
     /// first.
@@ -1299,6 +1309,7 @@ impl AgentMesh {
                 drain_trigger,
                 mailbox_drain_interval: clamp_drain_interval(opts.mailbox_drain_interval),
                 task_budgets: TaskBudgets::new(),
+                revoked_senders: RevokedSenders::new(),
                 delegations: std::sync::Mutex::new(HashMap::new()),
                 handler_options: RwLock::new(HashMap::new()),
                 admissions: RwLock::new(HashMap::new()),
@@ -1318,6 +1329,7 @@ impl AgentMesh {
                 cred_renewer: std::sync::Mutex::new(None),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 declared_feeds: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                feed_durable: Arc::new(crate::feed::FeedDurableShared::default()),
                 naming_gate: if opts.allow_unnamed {
                     None
                 } else {
@@ -1476,6 +1488,7 @@ impl AgentMesh {
                 drain_trigger,
                 mailbox_drain_interval: clamp_drain_interval(mailbox_drain_interval),
                 task_budgets: TaskBudgets::new(),
+                revoked_senders: RevokedSenders::new(),
                 delegations: std::sync::Mutex::new(HashMap::new()),
                 handler_options: RwLock::new(HashMap::new()),
                 admissions: RwLock::new(HashMap::new()),
@@ -1497,6 +1510,7 @@ impl AgentMesh {
                 cred_renewer: std::sync::Mutex::new(None),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 declared_feeds: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                feed_durable: Arc::new(crate::feed::FeedDurableShared::default()),
                 // The naming rule is asked for at connect; a hosted agent is
                 // built by its node, which does not carry the option (the TS
                 // SDK's addAgent does not either).
@@ -3776,72 +3790,127 @@ impl AgentMesh {
         let handle = tokio::spawn(async move {
             while let Some(msg) = sub.next().await {
                 let Ok(env) = codec::decode(&msg.payload) else { continue };
-                if let Some(refusal) = inbound::admit_envelope_scoped(
-                    &env,
-                    &inner.agent_id,
-                    &inner.seen_events,
-                    Some(&subject),
-                    InboundSource::Live,
-                    inbound::now_ms(),
-                ) {
-                    inner.warn(
-                        refusal,
-                        format!("Feed event on {} refused: {}", msg.subject, refusal.code()),
-                        &env.from,
-                        &msg.subject,
-                    );
+                let Some(payload) =
+                    admit_feed_delivery(&inner, &env, &msg.subject, &subject, InboundSource::Live)
+                else {
                     continue;
-                }
-                let data = env
-                    .payload
-                    .as_ref()
-                    .and_then(|p| p.get("data").cloned())
-                    .unwrap_or(Value::Null);
-                let (fence, max_chars) = {
-                    let opts = inner.inbound.read().unwrap();
-                    (opts.fence, opts.max_inbound_chars)
                 };
-                // §22.5 before anything reads the body.
-                if let Some(size) = inbound::over_inbound_cap(&data, max_chars) {
-                    let subject = &msg.subject;
-                    inner.warn(
-                        InboundRefusal::Oversize,
-                        format!(
-                            "Feed event on {subject} carries {size} characters of sender text, \
-                             over this agent's {max_chars}-character cap \
-                             (InboundOptions.max_inbound_chars)"
-                        ),
-                        &env.from,
-                        subject,
-                    );
-                    continue;
-                }
-                // §22.6.
-                let data = if fence {
-                    inbound::fence_inbound_input(
-                        &data,
-                        &FrameProvenance {
-                            from: &env.from,
-                            trace_id: Some(&env.trace.trace_id),
-                            ..Default::default()
-                        },
-                    )
-                } else {
-                    data
-                };
-                // Reassemble the full feed payload around the protected data.
-                let mut payload = match &env.payload {
-                    Some(Value::Object(map)) => Value::Object(map.clone()),
-                    _ => json!({}),
-                };
-                if let Value::Object(map) = &mut payload {
-                    map.insert("data".to_string(), data);
-                }
                 handler(payload, env);
             }
         });
         self.inner.tasks.lock().unwrap().push(handle);
         Ok(())
+    }
+
+    /// The binding behind [`AgentMesh::subscribe_feed_durable`] (§18.6 Feed
+    /// Consumer): consumer info, then create or add this feed to its filters,
+    /// then start the client's one pull loop if it is not running, all under
+    /// the shared lock so two binds never race. See that method for the
+    /// contract.
+    pub(crate) async fn subscribe_feed_durable_pipeline(
+        &self,
+        pattern: String,
+        handler: crate::feed::FeedHandler,
+    ) -> Result<crate::feed::DurableFeedSubscription> {
+        use async_nats::jetstream::consumer;
+        use async_nats::jetstream::context::ConsumerInfoErrorKind;
+
+        let stream_name = subjects::FEED_STREAM;
+        let durable = subjects::feed_consumer(&self.inner.agent_id);
+        let refused = |what: &str, e: &dyn std::fmt::Display| {
+            MeshError::Transport(format!(
+                "Durable feed subscription on {pattern} could not {what} this agent's feed \
+                 consumer {durable} on {stream_name} (§18.6 Feed Consumer): {e}. It needs \
+                 JetStream and the {stream_name} stream on this mesh, and a credential that \
+                 grants this agent its own feed consumer; a credential minted before that \
+                 grant existed is refused until it is renewed, which gives it the grant. Not \
+                 falling back to a live subscription: durability was asked for."
+            ))
+        };
+
+        let shared = self.inner.feed_durable.clone();
+        let mut state = shared.state.lock().await;
+
+        // No STREAM.INFO: the agent's credential grants only its own consumer's
+        // subjects on MESH_FEED, so everything below is a consumer call.
+        let js = async_nats::jetstream::new(self.inner.client.clone());
+        let stream = js
+            .get_stream_no_info(stream_name)
+            .await
+            .map_err(|e| refused("reach", &e))?;
+        match stream.consumer_info(&durable).await {
+            Ok(info) => {
+                let existing = info.config;
+                if let Some(filters) = crate::feed::feed_filters_with(
+                    &existing.filter_subjects,
+                    &existing.filter_subject,
+                    &pattern,
+                ) {
+                    let updated = consumer::Config {
+                        filter_subject: String::new(),
+                        filter_subjects: filters,
+                        ..existing
+                    };
+                    stream
+                        .update_consumer(updated)
+                        .await
+                        .map_err(|e| refused("add this feed to", &e))?;
+                }
+            }
+            Err(e) if matches!(e.kind(), ConsumerInfoErrorKind::NotFound) => {
+                stream
+                    .create_consumer(crate::feed::feed_consumer_config(&durable, &pattern))
+                    .await
+                    .map_err(|e| refused("create", &e))?;
+            }
+            Err(e) => return Err(refused("read", &e)),
+        }
+
+        // A loop that `close()` aborted is not running, whatever the state says.
+        if state.as_ref().is_some_and(|running| running.task.is_finished()) {
+            *state = None;
+        }
+        if state.is_none() {
+            let pull: consumer::PullConsumer = stream
+                .get_consumer(&durable)
+                .await
+                .map_err(|e| refused("bind", &e))?;
+            let handlers: crate::feed::FeedHandlers = Default::default();
+            let inner = self.inner.clone();
+            let loop_handlers = handlers.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    // Rebuilt from the same durable when the pull stream breaks
+                    // (a reconnect, a missed heartbeat); the server-side cursor
+                    // is what makes that safe.
+                    let Ok(mut messages) = pull.messages().await else {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    };
+                    while let Some(item) = messages.next().await {
+                        let Ok(msg) = item else { break };
+                        handle_durable_feed_delivery(&inner, &loop_handlers, msg).await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
+            let task = handle.abort_handle();
+            // Tracked like every other background task, so `close()` ends it.
+            self.inner.tasks.lock().unwrap().push(handle);
+            *state = Some(crate::feed::FeedDurableLoop { handlers, task });
+        }
+
+        let id = shared
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let running = state.as_ref().expect("the loop was just ensured");
+        running
+            .handlers
+            .write()
+            .unwrap()
+            .insert(pattern.clone(), (id, handler));
+        drop(state);
+        Ok(crate::feed::DurableFeedSubscription { durable, subject: pattern, id, shared })
     }
 
     /// Subscribe to events **durably** (§18.6 Event Consumer): bind a durable
@@ -4064,6 +4133,10 @@ impl AgentMesh {
         // that safe, and it is deliberately NOT cleared here: it belongs to the
         // running pass, which releases it when it (or its abort) drops the guard.
         *self.inner.inbox_subject_guarded.lock().unwrap() = None;
+        // The feed pull loop was among the aborted tasks. Forget it so a later
+        // durable feed subscription starts a fresh one; the consumer itself
+        // stays on the server with its cursor.
+        *self.inner.feed_durable.state.lock().await = None;
         self.inner
             .offline_drain_started
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -4425,6 +4498,136 @@ async fn handle_durable_event(
     };
     handler(data, env);
     let _ = msg.ack().await;
+}
+
+/// The §22 pipeline for one feed delivery, shared by the live
+/// ([`AgentMesh::subscribe_feed`]) and durable
+/// ([`AgentMesh::subscribe_feed_durable`]) paths so they cannot drift:
+/// §22.2 → §22.4 → §22.3 over the event memory, scoped to the subscription
+/// pattern `scope`, on the window `source` picks; the §22.5 cap and §22.6
+/// fence over the payload's `data`; refusals to the warning sink (§22.7).
+/// Returns the full `{topic, kind, data}` payload with the protected `data`
+/// put back in place, or `None` when the delivery was refused.
+fn admit_feed_delivery(
+    inner: &Inner,
+    env: &Envelope,
+    delivered_on: &str,
+    scope: &str,
+    source: InboundSource,
+) -> Option<Value> {
+    let label = match source {
+        InboundSource::Live => "Feed event",
+        _ => "Durable feed event",
+    };
+    if let Some(refusal) = inbound::admit_envelope_scoped(
+        env,
+        &inner.agent_id,
+        &inner.seen_events,
+        Some(scope),
+        source,
+        inbound::now_ms(),
+    ) {
+        inner.warn(
+            refusal,
+            format!("{label} on {delivered_on} refused: {}", refusal.code()),
+            &env.from,
+            delivered_on,
+        );
+        return None;
+    }
+    let data = env
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("data").cloned())
+        .unwrap_or(Value::Null);
+    let (fence, max_chars) = {
+        let opts = inner.inbound.read().unwrap();
+        (opts.fence, opts.max_inbound_chars)
+    };
+    // §22.5 before anything reads the body.
+    if let Some(size) = inbound::over_inbound_cap(&data, max_chars) {
+        inner.warn(
+            InboundRefusal::Oversize,
+            format!(
+                "{label} on {delivered_on} carries {size} characters of sender text, over \
+                 this agent's {max_chars}-character cap (InboundOptions.max_inbound_chars)"
+            ),
+            &env.from,
+            delivered_on,
+        );
+        return None;
+    }
+    // §22.6.
+    let data = if fence {
+        inbound::fence_inbound_input(
+            &data,
+            &FrameProvenance {
+                from: &env.from,
+                trace_id: Some(&env.trace.trace_id),
+                ..Default::default()
+            },
+        )
+    } else {
+        data
+    };
+    // Reassemble the full feed payload around the protected data.
+    let mut payload = match &env.payload {
+        Some(Value::Object(map)) => Value::Object(map.clone()),
+        _ => json!({}),
+    };
+    if let Value::Object(map) = &mut payload {
+        map.insert("data".to_string(), data);
+    }
+    Some(payload)
+}
+
+/// One delivery on the §18.6 Feed Consumer. Undecodable bytes are acked and
+/// dropped (they will not decode on redelivery either). A delivery no handler
+/// here follows is handed back after [`crate::feed::FEED_UNCLAIMED_NAK`].
+/// Otherwise every handler whose pattern matches gets it through
+/// [`admit_feed_delivery`] on the buffered window, and the ack comes after
+/// they all return; a handler that panics leaves it unacked, so the server
+/// redelivers after the ack wait (up to max_deliver).
+async fn handle_durable_feed_delivery(
+    inner: &Arc<Inner>,
+    handlers: &crate::feed::FeedHandlers,
+    msg: async_nats::jetstream::Message,
+) {
+    use async_nats::jetstream::AckKind;
+    let Ok(env) = codec::decode(&msg.payload) else {
+        let _ = msg.ack().await;
+        return;
+    };
+    let subject = msg.subject.to_string();
+    let claimed: Vec<(String, crate::feed::FeedHandler)> = handlers
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|(pattern, _)| crate::feed::feed_subject_matches(pattern, &subject))
+        .map(|(pattern, (_, h))| (pattern.clone(), h.clone()))
+        .collect();
+    if claimed.is_empty() {
+        // Nobody here follows this feed (yet): hand it back for later.
+        let _ = msg.ack_with(AckKind::Nak(Some(crate::feed::FEED_UNCLAIMED_NAK))).await;
+        return;
+    }
+    let mut failed = false;
+    for (pattern, handler) in claimed {
+        let Some(payload) =
+            admit_feed_delivery(inner, &env, &subject, &pattern, InboundSource::Mailbox)
+        else {
+            continue;
+        };
+        let env = env.clone();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(payload, env)));
+        if ran.is_err() {
+            failed = true;
+        }
+    }
+    if !failed {
+        // After every handler returned: the ack means "durably handled".
+        let _ = msg.ack().await;
+    }
 }
 
 /// What the bounded drain does with one delivered mailbox message, given the
@@ -4895,6 +5098,55 @@ async fn fetch_manifest_owner(inner: &Arc<Inner>, agent_id: &str) -> Option<Stri
     resp_env.payload.as_ref()?.get("owner").and_then(Value::as_str).map(str::to_string)
 }
 
+/// Ask the registry whether `key` is a revoked agent key, or a paused agent
+/// (§5.3, §4.12). A registry `get` answers a revoked key with `UNAUTHORIZED`,
+/// `details.reason: agent_key_revoked`, and a paused agent with its manifest
+/// carrying `status: "paused"`; any other answer, a manifest or not-found
+/// included, means not revoked. Anything that is not a signed answer from the
+/// registry to this question is `Unknown`, which the memo treats as "let it
+/// through". The memo applies its own timeout.
+async fn registry_revocation(inner: Arc<Inner>, key: String) -> RevocationAnswer {
+    let mut env = Envelope::new(PrimitiveType::Discover, &inner.agent_id);
+    env.payload = Some(json!({ "agent_id": key }));
+    inner.sign(&mut env);
+    let Ok(bytes) = codec::encode(&env) else {
+        return RevocationAnswer::Unknown;
+    };
+    let Ok(resp) = inner.client.request(subjects::registry_get(&key), bytes.into()).await else {
+        return RevocationAnswer::Unknown;
+    };
+    let Ok(resp_env) = codec::decode(&resp.payload) else {
+        return RevocationAnswer::Unknown;
+    };
+    // Bound to this question: an answer to some other request is no answer.
+    if resp_env.in_reply_to.as_deref().is_some_and(|id| id != env.id) {
+        return RevocationAnswer::Unknown;
+    }
+    if let Some(err) = &resp_env.error {
+        let details = err.details.as_ref();
+        let reason = details.and_then(|d| d.get("reason")).and_then(Value::as_str);
+        if err.code == ErrorCode::Unauthorized.as_str() && reason == Some("agent_key_revoked") {
+            let text = |k: &str| details.and_then(|d| d.get(k)).and_then(Value::as_str).map(str::to_string);
+            return RevocationAnswer::Revoked {
+                revoked_at: text("revoked_at"),
+                replaced_by: text("replaced_by"),
+            };
+        }
+        return RevocationAnswer::NotRevoked { paused: false, since: None };
+    }
+    // The kill switch (§9 registry status): a paused agent's manifest says
+    // so, and a receiver refuses what it sends until it is resumed.
+    let payload = resp_env.payload.as_ref();
+    if payload.and_then(|p| p.get("status")).and_then(Value::as_str) == Some("paused") {
+        let since = payload
+            .and_then(|p| p.get("status_since"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        return RevocationAnswer::NotRevoked { paused: true, since };
+    }
+    RevocationAnswer::NotRevoked { paused: false, since: None }
+}
+
 /// The platform's agreement record for one consumer account, filtered to THIS
 /// seller by the service (§19.5). The default lookup: a deployment that runs
 /// the platform gets enforcement with nothing to wire, and one that does not
@@ -4960,6 +5212,83 @@ fn respond_destination(
         return transport_reply.map(str::to_string);
     }
     Some(subjects::agent_inbox(sender))
+}
+
+/// Answer a request from a revoked or paused sender (§5.3) with
+/// `UNAUTHORIZED`, and raise the local signal. The handler never runs.
+async fn refuse_revoked_sender(
+    inner: &Arc<Inner>,
+    env: &Envelope,
+    respond_to: Option<&str>,
+    r: &crate::revoked_senders::RevokedSender,
+) {
+    let (error, code, warning) = if r.paused {
+        // The kill switch (§4.12): a paused sender's node may still be able
+        // to publish, so the receiver refusing is what makes the pause hold.
+        let mut details = json!({ "reason": "agent_paused" });
+        if let Some(since) = &r.since {
+            details["stopped_at"] = json!(since);
+        }
+        (
+            ErrorObject {
+                code: ErrorCode::Unauthorized.as_str().to_string(),
+                message: "The agent that sent this is paused by its owner or by AgentMesh, so its \
+                          messages are refused until it is resumed (§5.3)."
+                    .to_string(),
+                details: Some(details),
+                retryable: false,
+                retry_after_ms: None,
+            },
+            "stopped_sender",
+            "refused a request from an agent that is paused by the kill switch".to_string(),
+        )
+    } else {
+        let mut details = json!({ "reason": "agent_key_revoked" });
+        if let Some(at) = &r.revoked_at {
+            details["revoked_at"] = json!(at);
+        }
+        if let Some(to) = &r.replaced_by {
+            details["replaced_by"] = json!(to);
+        }
+        let moved = r
+            .replaced_by
+            .as_ref()
+            .map(|to| format!("; the agent moved to {to}"))
+            .unwrap_or_default();
+        (
+            ErrorObject {
+                code: ErrorCode::Unauthorized.as_str().to_string(),
+                message: "The key that signed this message has been revoked, so it is refused (§5.3)."
+                    .to_string(),
+                details: Some(details),
+                retryable: false,
+                retry_after_ms: None,
+            },
+            "revoked_sender",
+            format!("refused a request signed by a revoked key{moved}"),
+        )
+    };
+    if let Some(reply) = respond_to {
+        let resp = inner.refusal_resp(env, error);
+        if let Ok(bytes) = codec::encode(&resp) {
+            let _ = inner.client.publish(reply.to_string(), bytes.clone().into()).await;
+            // Tap: the refusal is observable to the operator surfaces, like
+            // every other response this agent makes.
+            let _ = inner
+                .client
+                .publish(subjects::agent_outbox(&inner.agent_id), bytes.into())
+                .await;
+        }
+    }
+    let sink = inner.inbound.read().unwrap().on_security_warning.clone();
+    if let Some(sink) = sink {
+        sink(SecurityWarning {
+            code: code.to_string(),
+            message: warning,
+            subject: Some(inner.agent_id.clone()),
+            from: Some(env.from.clone()),
+        });
+    }
 }
 
 /// Dispatch one verified inbound `request`, whatever path it arrived on.
@@ -5038,17 +5367,6 @@ async fn dispatch_inbound(
         return;
     }
 
-    // §7.7 scope: a request arriving WITH a task id and a budget is work whose
-    // Task inherits that budget — record it (latest-wins) so revisions have a
-    // baseline and `task_budget` answers for the responder side too. A
-    // malformed budget block is not recorded; it still reaches the handler
-    // verbatim via the context, whose admission judgement it is.
-    if let (Some(task_id), Some(budget)) = (env.task_id.as_deref(), env.budget.as_ref()) {
-        if budget.validate().is_ok() {
-            inner.task_budgets.apply(task_id, budget);
-        }
-    }
-
     let payload = env.payload.clone().unwrap_or(Value::Null);
     // Deprecation window (§8.5): senders on pre-rename SDKs say `skill`.
     // Normalized once here; everything this SDK emits uses only the new name.
@@ -5070,10 +5388,39 @@ async fn dispatch_inbound(
     let respond_to =
         respond_destination(&offering, guarded_delivery, &env.from, reply.as_deref());
 
-    let (fence, max_chars) = {
+    let (fence, max_chars, refuse_revoked) = {
         let opts = inner.inbound.read().unwrap();
-        (opts.fence, opts.max_inbound_chars)
+        (opts.fence, opts.max_inbound_chars, opts.refuse_revoked_senders)
     };
+
+    // ── §5.3 revoked or paused sender ──
+    // "Receivers MUST refuse a message signed by a revoked agent key." The
+    // signature (checked at decode) proves which key signed; this asks
+    // whether that key is still its owner's. After the cheap §22 checks, so a
+    // malformed or replayed envelope costs no registry question, and before
+    // anything is handled or answered as though the sender were who it says.
+    if refuse_revoked {
+        let lookup_inner = inner.clone();
+        let refused = inner
+            .revoked_senders
+            .check(&env.from, move |key| registry_revocation(lookup_inner, key))
+            .await;
+        if let Some(r) = refused {
+            refuse_revoked_sender(&inner, &env, respond_to.as_deref(), &r).await;
+            return;
+        }
+    }
+
+    // §7.7 scope: a request arriving WITH a task id and a budget is work whose
+    // Task inherits that budget — record it (latest-wins) so revisions have a
+    // baseline and `task_budget` answers for the responder side too. A
+    // malformed budget block is not recorded; it still reaches the handler
+    // verbatim via the context, whose admission judgement it is.
+    if let (Some(task_id), Some(budget)) = (env.task_id.as_deref(), env.budget.as_ref()) {
+        if budget.validate().is_ok() {
+            inner.task_budgets.apply(task_id, budget);
+        }
+    }
 
     // ── §22.5 inbound size cap ──
     // Before the handler is resolved and before the stream branch, because

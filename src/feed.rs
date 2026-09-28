@@ -61,6 +61,146 @@ pub fn feed_lookup_payload(agent_id: &str, topic: &str) -> Value {
     json!({ "agent": agent_id, "topic": topic })
 }
 
+// ─── §18.6 Feed Consumer: durable feed subscriptions ────────────────────────
+
+/// §18.6 Feed Consumer: how long a delivery may sit unacked before the server
+/// redelivers it. Pinned by SPEC, the same figure as the Event Consumer's.
+pub(crate) const FEED_ACK_WAIT: Duration = Duration::from_secs(30);
+/// §18.6 Feed Consumer: how many times one delivery is attempted.
+pub(crate) const FEED_MAX_DELIVER: i64 = 5;
+/// A delivery on the feed consumer whose feed no subscription in this process
+/// follows (yet) is handed back after this long, so a process that subscribes
+/// its feeds one after another does not lose a delivery for one it has not
+/// reached; max_deliver bounds how often. Same figure as the TypeScript SDK's
+/// `FEED_UNCLAIMED_NAK_MS`.
+pub(crate) const FEED_UNCLAIMED_NAK: Duration = Duration::from_secs(5);
+
+/// Whether a feed delivery subject matches a feed subscription pattern:
+/// `mesh.feed.{agent}.{topic}` exactly, or `mesh.feed.{agent}.*` for every
+/// topic of one agent. The only two pattern shapes [`subjects::feed_pattern`]
+/// builds, so the only two this needs to understand.
+pub(crate) fn feed_subject_matches(pattern: &str, subject: &str) -> bool {
+    if pattern == subject {
+        return true;
+    }
+    let p: Vec<&str> = pattern.split('.').collect();
+    let s: Vec<&str> = subject.split('.').collect();
+    p.len() == 4 && s.len() == 4 && p[3] == "*" && p[0] == s[0] && p[1] == s[1] && p[2] == s[2]
+}
+
+/// The consumer config a first durable feed subscription creates (§18.6 Feed
+/// Consumer): explicit ack, deliver new, 30s ack wait, 5 deliveries, and this
+/// one feed as the only filter subject.
+pub(crate) fn feed_consumer_config(
+    durable: &str,
+    pattern: &str,
+) -> async_nats::jetstream::consumer::pull::Config {
+    use async_nats::jetstream::consumer::{pull, AckPolicy, DeliverPolicy};
+    pull::Config {
+        durable_name: Some(durable.to_string()),
+        ack_policy: AckPolicy::Explicit,
+        deliver_policy: DeliverPolicy::New,
+        ack_wait: FEED_ACK_WAIT,
+        max_deliver: FEED_MAX_DELIVER,
+        filter_subjects: vec![pattern.to_string()],
+        ..Default::default()
+    }
+}
+
+/// The filter subjects an existing feed consumer should have once `pattern`
+/// is added, or `None` when it already filters on it. The existing filters are
+/// `filter_subjects`, or the single `filter_subject` when that is what the
+/// consumer was made with. Nothing is ever removed.
+pub(crate) fn feed_filters_with(
+    filter_subjects: &[String],
+    filter_subject: &str,
+    pattern: &str,
+) -> Option<Vec<String>> {
+    let mut filters: Vec<String> = if !filter_subjects.is_empty() {
+        filter_subjects.to_vec()
+    } else if !filter_subject.is_empty() {
+        vec![filter_subject.to_string()]
+    } else {
+        Vec::new()
+    };
+    if filters.iter().any(|f| f == pattern) {
+        return None;
+    }
+    filters.push(pattern.to_string());
+    Some(filters)
+}
+
+/// One durable feed handler as the shared pull loop calls it.
+pub(crate) type FeedHandler = std::sync::Arc<dyn Fn(Value, Envelope) + Send + Sync>;
+/// Feed pattern to (subscription id, handler). The id tells a stale `stop()`
+/// apart from the subscription that replaced it on the same pattern.
+pub(crate) type FeedHandlers =
+    std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, (u64, FeedHandler)>>>;
+
+/// The client's one running feed pull loop and the handlers it dispatches to.
+pub(crate) struct FeedDurableLoop {
+    pub(crate) handlers: FeedHandlers,
+    pub(crate) task: tokio::task::AbortHandle,
+}
+
+/// Per-client state behind durable feed subscriptions. The mutex is held for
+/// the whole of a bind, which is what serializes two concurrent
+/// `subscribe_feed_durable` calls so they cannot race an update of the
+/// consumer's filters.
+#[derive(Default)]
+pub(crate) struct FeedDurableShared {
+    pub(crate) state: tokio::sync::Mutex<Option<FeedDurableLoop>>,
+    pub(crate) next_id: std::sync::atomic::AtomicU64,
+}
+
+/// A running durable feed subscription ([`AgentMesh::subscribe_feed_durable`],
+/// SPEC §18.6 Feed Consumer).
+///
+/// `stop()` removes this subscription's handler and, when it was the last
+/// one, ends the client's pull loop. It never deletes the consumer and never
+/// removes a filter subject: the consumer is the server-side cursor, and the
+/// next start of this agent picks up what arrived while it was away.
+pub struct DurableFeedSubscription {
+    pub(crate) durable: String,
+    pub(crate) subject: String,
+    pub(crate) id: u64,
+    pub(crate) shared: std::sync::Arc<FeedDurableShared>,
+}
+
+impl DurableFeedSubscription {
+    /// The agent's one feed consumer on `MESH_FEED`, `mesh_feed_{agent_id}`.
+    pub fn durable(&self) -> &str {
+        &self.durable
+    }
+
+    /// The feed subject (or `mesh.feed.{agent}.*` pattern) this follows.
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// Stop this subscription. See the type docs for what is kept.
+    pub async fn stop(&self) {
+        let mut state = self.shared.state.lock().await;
+        let Some(running) = state.as_ref() else { return };
+        let now_empty = {
+            let mut handlers = running.handlers.write().unwrap();
+            match handlers.get(&self.subject) {
+                Some((id, _)) if *id == self.id => {
+                    handlers.remove(&self.subject);
+                }
+                // Replaced by a later subscription on the same feed, or
+                // already stopped: nothing of ours to remove.
+                _ => return,
+            }
+            handlers.is_empty()
+        };
+        if now_empty {
+            running.task.abort();
+            *state = None;
+        }
+    }
+}
+
 impl AgentMesh {
     /// Publish onto one of this agent's own feeds (§6.6a): an ordinary `emit`
     /// on `mesh.feed.{own key}.{topic}` carrying the pinned
@@ -109,6 +249,46 @@ impl AgentMesh {
     {
         let subject = subjects::feed_pattern(agent_id, topic)?;
         self.subscribe_feed_pipeline(subject, handler).await
+    }
+
+    /// Subscribe to one agent's feed (or all of them, `topic == "*"`)
+    /// **durably**: SPEC §18.6 Feed Consumer. What was published while this
+    /// agent was offline is delivered when it comes back, and a delivery its
+    /// handler panicked on is redelivered. The TypeScript SDK spells this
+    /// `subscribeFeed(owner, topic, handler, { durable: true })`.
+    ///
+    /// The feed is added to this agent's ONE durable pull consumer on
+    /// `MESH_FEED`, named [`subjects::feed_consumer`] (`mesh_feed_{agent_id}`),
+    /// whose filter subjects are every feed it follows durably. When the
+    /// consumer is missing it is created (explicit ack, deliver new, 30s ack
+    /// wait, 5 deliveries); when it stands without this feed its filters are
+    /// updated to add it. Bindings are serialized, so two concurrent calls
+    /// cannot race that update. Filters are never removed.
+    ///
+    /// One pull loop per client serves every durable feed subscription,
+    /// because a pull consumer divides its deliveries among whoever pulls.
+    /// Each delivery runs the same §22 pipeline as
+    /// [`AgentMesh::subscribe_feed`] (full `{topic, kind, data}` payload to the
+    /// handler), on the buffered §22.3 window and deduplicated per pattern,
+    /// for every handler whose pattern matches, and is acked after they all
+    /// return. Undecodable bytes are acked and dropped. A delivery no handler
+    /// in this process follows yet is handed back with a 5 second delay.
+    ///
+    /// A missing `MESH_FEED` stream or a refused JetStream call is an error,
+    /// never a silent live subscription: a caller who asked for durability
+    /// must not get the weaker thing. A credential minted before the
+    /// feed-consumer grant existed is refused here until it is renewed.
+    pub async fn subscribe_feed_durable<F>(
+        &self,
+        agent_id: &str,
+        topic: &str,
+        handler: F,
+    ) -> Result<DurableFeedSubscription>
+    where
+        F: Fn(Value, Envelope) + Send + Sync + 'static,
+    {
+        let pattern = subjects::feed_pattern(agent_id, topic)?;
+        self.subscribe_feed_durable_pipeline(pattern, std::sync::Arc::new(handler)).await
     }
 
     /// Read a state feed's current value (§18.3, request-reply on
@@ -229,6 +409,98 @@ mod tests {
         assert_eq!(topic, "open-calls_v1");
         // The lookup subject has three tokens and is never a feed.
         assert_eq!(subjects::parse_feed_subject(subjects::FEED_GET), None);
+    }
+
+    #[test]
+    fn the_feed_consumer_is_named_for_the_agent() {
+        assert_eq!(subjects::feed_consumer(OWNER), format!("mesh_feed_{OWNER}"));
+        // One consumer per agent: the name does not depend on any feed.
+        assert!(!subjects::feed_consumer(OWNER).contains('.'));
+    }
+
+    #[test]
+    fn feed_patterns_match_exactly_or_by_the_one_wildcard() {
+        let status = subjects::feed(OWNER, "status").unwrap();
+        let rounds = subjects::feed(OWNER, "rounds").unwrap();
+        let all = subjects::feed_pattern(OWNER, "*").unwrap();
+        assert!(feed_subject_matches(&status, &status));
+        assert!(!feed_subject_matches(&status, &rounds));
+        assert!(feed_subject_matches(&all, &status));
+        assert!(feed_subject_matches(&all, &rounds));
+        // Another owner's feed, a deeper subject, or a different prefix.
+        let other = "UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(!feed_subject_matches(&all, &format!("mesh.feed.{other}.status")));
+        assert!(!feed_subject_matches(&all, &format!("mesh.feed.{OWNER}.status.x")));
+        assert!(!feed_subject_matches(&all, &format!("mesh.event.{OWNER}.status")));
+        // A wildcard is only a pattern, never a subject that matches one.
+        assert!(!feed_subject_matches(&status, &all));
+    }
+
+    #[test]
+    fn the_first_bind_creates_the_consumer_to_the_spec_pins() {
+        use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
+        let durable = subjects::feed_consumer(OWNER);
+        let pattern = subjects::feed(OWNER, "status").unwrap();
+        let c = feed_consumer_config(&durable, &pattern);
+        assert_eq!(c.durable_name.as_deref(), Some(durable.as_str()));
+        assert_eq!(c.ack_policy, AckPolicy::Explicit);
+        assert_eq!(c.deliver_policy, DeliverPolicy::New);
+        assert_eq!(c.ack_wait, Duration::from_secs(30));
+        assert_eq!(c.max_deliver, 5);
+        assert_eq!(c.filter_subjects, vec![pattern]);
+        assert!(c.filter_subject.is_empty());
+        assert_eq!(FEED_UNCLAIMED_NAK, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_later_bind_adds_its_filter_and_never_removes_one() {
+        let a = "mesh.feed.X.a".to_string();
+        let b = "mesh.feed.X.b".to_string();
+        // Already there: no update.
+        assert_eq!(feed_filters_with(std::slice::from_ref(&a), "", &a), None);
+        assert_eq!(feed_filters_with(&[], &a, &a), None);
+        // Added after the existing ones, which are kept in order.
+        assert_eq!(feed_filters_with(std::slice::from_ref(&a), "", &b), Some(vec![a.clone(), b.clone()]));
+        // A consumer made with the single filter_subject is carried over.
+        assert_eq!(feed_filters_with(&[], &a, &b), Some(vec![a.clone(), b.clone()]));
+        // A consumer with no filter at all gets exactly this one.
+        assert_eq!(feed_filters_with(&[], "", &b), Some(vec![b]));
+    }
+
+    #[tokio::test]
+    async fn stop_removes_only_its_own_handler_and_the_last_one_ends_the_loop() {
+        let shared = std::sync::Arc::new(FeedDurableShared::default());
+        let handlers: FeedHandlers = Default::default();
+        let task = tokio::spawn(std::future::pending::<()>());
+        *shared.state.lock().await =
+            Some(FeedDurableLoop { handlers: handlers.clone(), task: task.abort_handle() });
+        let h: FeedHandler = std::sync::Arc::new(|_, _| {});
+        let sub = |subject: &str, id: u64| DurableFeedSubscription {
+            durable: subjects::feed_consumer(OWNER),
+            subject: subject.to_string(),
+            id,
+            shared: shared.clone(),
+        };
+        handlers.write().unwrap().insert("s.a".into(), (1, h.clone()));
+        handlers.write().unwrap().insert("s.b".into(), (2, h.clone()));
+        let a = sub("s.a", 1);
+        assert_eq!(a.durable(), subjects::feed_consumer(OWNER));
+        assert_eq!(a.subject(), "s.a");
+
+        // A stale subscription (replaced on the same feed) removes nothing.
+        sub("s.a", 99).stop().await;
+        assert_eq!(handlers.read().unwrap().len(), 2);
+
+        a.stop().await;
+        assert_eq!(handlers.read().unwrap().len(), 1);
+        assert!(shared.state.lock().await.is_some(), "one handler left, the loop runs on");
+
+        sub("s.b", 2).stop().await;
+        assert!(shared.state.lock().await.is_none(), "the last stop ends the loop");
+        let ended = task.await;
+        assert!(ended.unwrap_err().is_cancelled());
+        // Stopping again after the loop is gone is harmless.
+        a.stop().await;
     }
 
     #[test]

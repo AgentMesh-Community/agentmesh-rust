@@ -1,6 +1,6 @@
 # Rust SDK status
 
-Status as of 2026-09-27, version 0.20.0.
+Status as of 2026-09-28, version 0.21.0.
 
 ## What it covers
 
@@ -12,6 +12,7 @@ Status as of 2026-09-27, version 0.20.0.
 | Node hosting, node vouch renewal (4.4), credential renewal (4.8) with a built-in HTTPS client | Done. |
 | The naming rule, on by default | Done. |
 | Inbound protections (SPEC 22) | Done. |
+| Refusing revoked and paused senders on receive (SPEC 5.3, 4.12) | Done in 0.21.0. |
 | Offline mailbox drain (16.4), presence (9.6), durable event subscriptions (18.6) | Done. |
 | Rooms (EXT-5): capability, sealed and acl grades, playbooks, the work board | Done. |
 | Pairwise sealing (EXT-7), admission (EXT-6), owner allowance (EXT-8) | Done. |

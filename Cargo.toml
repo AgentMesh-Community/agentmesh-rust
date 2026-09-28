@@ -1,11 +1,12 @@
 [package]
 name = "agentmesh"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 description = "Rust SDK for AgentMesh: signed agent-to-agent messaging over NATS"
 license = "Apache-2.0"
 homepage = "https://agentmesh.ai"
 documentation = "https://dev.agentmesh.ai/spec.html"
+
 repository = "https://github.com/AgentMesh-Community/agentmesh-rust"
 readme = "README.md"
 
@@ -58,4 +59,4 @@ sha2 = "0.10"
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "http2"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }

@@ -148,7 +148,9 @@ impl InboundRefusal {
 pub struct SecurityWarning {
     /// `inbound_oversize` | `inbound_duplicate` | `inbound_stale` |
     /// `inbound_misaddressed` | `sent_in_clear` (§8.9, the one OUTBOUND signal:
-    /// a recipient asked to be sealed to and this SDK could not).
+    /// a recipient asked to be sealed to and this SDK could not) |
+    /// `revoked_sender` | `stopped_sender` (§5.3: a request refused because
+    /// its sender's key is revoked, or its sender is paused).
     pub code: String,
     pub message: String,
     /// The subject or agent the observation is about.
@@ -188,6 +190,19 @@ pub struct InboundOptions {
     /// dealt with is a different act, and one an operator should choose rather
     /// than inherit. Spans carry no payload, no sender text and no amounts.
     pub emit_spans: bool,
+    /// Refuse a request signed by a revoked agent key, or sent by an agent
+    /// paused by the kill switch (§5.3, §4.12).
+    ///
+    /// **Default: true.** Before a request is handled, the registry is asked
+    /// whether its sender's key has been revoked or the sender paused (a short
+    /// memo keeps this to one question a minute per sender, see
+    /// [`crate::revoked_senders`]). A revoked sender gets `UNAUTHORIZED` with
+    /// `details.reason: "agent_key_revoked"`, a paused one `UNAUTHORIZED` with
+    /// `details.reason: "agent_paused"`, instead of a handler run. A check that
+    /// cannot answer lets the message through; a key once seen revoked is
+    /// refused for the life of the process. `false` turns it off, for tests and
+    /// for a host that makes the check itself.
+    pub refuse_revoked_senders: bool,
 }
 
 impl Default for InboundOptions {
@@ -197,6 +212,7 @@ impl Default for InboundOptions {
             max_inbound_chars: DEFAULT_MAX_INBOUND_CHARS,
             on_security_warning: None,
             emit_spans: false,
+            refuse_revoked_senders: true,
         }
     }
 }
@@ -208,6 +224,7 @@ impl std::fmt::Debug for InboundOptions {
             .field("max_inbound_chars", &self.max_inbound_chars)
             .field("on_security_warning", &self.on_security_warning.is_some())
             .field("emit_spans", &self.emit_spans)
+            .field("refuse_revoked_senders", &self.refuse_revoked_senders)
             .finish()
     }
 }
