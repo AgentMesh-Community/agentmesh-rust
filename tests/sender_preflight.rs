@@ -152,7 +152,7 @@ fn manifest_with_offering(offering_id: &str, output_modes: Vec<String>) -> Manif
             output_modes: Some(output_modes),
             streaming: None,
                 needs: None,
-                delivers: None, reporting: None,
+                delivers: None, reporting: None, trial: None,
         }],
         emits: None,
         accepts: None,

@@ -43,7 +43,7 @@ async fn rust_client_registers_and_discovers_via_ts_registry() {
                 output_modes: None,
                 streaming: None,
                 needs: None,
-                delivers: None, reporting: None,
+                delivers: None, reporting: None, trial: None,
             }],
             ..Default::default()
         })

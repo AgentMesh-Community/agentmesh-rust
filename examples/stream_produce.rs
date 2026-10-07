@@ -16,7 +16,7 @@ async fn main() {
     mesh.register(RegisterOptions {
         name: "Rust Streamer".into(),
         capabilities: vec!["count".into()],
-        offerings: vec![Offering { id: "count".into(), name: "Count".into(), description: "streams N ticks".into(), tags: None, input_modes: None, output_modes: None, streaming: Some(true), needs: None, delivers: None, reporting: None }],
+        offerings: vec![Offering { id: "count".into(), name: "Count".into(), description: "streams N ticks".into(), tags: None, input_modes: None, output_modes: None, streaming: Some(true), needs: None, delivers: None, reporting: None, trial: None }],
         ..Default::default()
     }).await.unwrap();
     let mut f = std::fs::File::create(std::env::var("ID_FILE").unwrap()).unwrap();

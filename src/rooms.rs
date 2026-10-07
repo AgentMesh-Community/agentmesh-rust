@@ -698,7 +698,75 @@ pub struct FetchedArtifact {
     pub digest: String,
     pub media_type: Option<String>,
     pub size: u64,
+    /// Where the bytes came from before this room, when the attacher said (EXT-5 §5.1).
+    pub origin: Option<String>,
     pub data: Vec<u8>,
+}
+
+/// What [`Room::attach_with`] says about a file beside its bytes.
+#[derive(Debug, Clone, Default)]
+pub struct AttachOptions {
+    /// The file's version. "1" when left out.
+    pub version: Option<String>,
+    pub media_type: Option<String>,
+    /// Where the bytes came from before this room (EXT-5 §5.1).
+    pub origin: Option<String>,
+    /// What the file is to the meeting: "input", "interim" or "output".
+    pub role: Option<String>,
+    /// The channel to announce it on. The room's first when left out.
+    pub channel: Option<String>,
+}
+
+/// What [`Room::link`] announces about a file the room does not hold.
+#[derive(Debug, Clone, Default)]
+pub struct LinkOptions {
+    /// Where the bytes are.
+    pub location: String,
+    /// What they should hash to: `sha256:` and 64 hex digits.
+    pub digest: String,
+    pub size: Option<u64>,
+    pub version: Option<String>,
+    pub media_type: Option<String>,
+    pub origin: Option<String>,
+    pub role: Option<String>,
+    pub channel: Option<String>,
+}
+
+/// What [`Room::link`] answers: the file's ref on the drive's index, the
+/// digest as claimed, and where the bytes are.
+#[derive(Debug, Clone)]
+pub struct LinkResult {
+    pub ref_: String,
+    pub digest: String,
+    pub size: Option<u64>,
+    pub external: String,
+}
+
+/// One file on a room's drive, as the rooms service records it: who attached
+/// it, when, and where it came from, which the transcript does not carry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomFile {
+    #[serde(rename = "ref")]
+    pub ref_: String,
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub digest: String,
+    #[serde(default)]
+    pub media_type: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub attached_by: String,
+    #[serde(default)]
+    pub attached_at: String,
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Where the bytes are when the drive does not hold them; the digest is
+    /// then the attaching member's claim.
+    #[serde(default)]
+    pub external: Option<String>,
 }
 
 // ── notes on a file (EXT-5 §8.4) ────────────────────────────────────────────
@@ -1408,6 +1476,119 @@ impl Room {
         }
     }
 
+    /// Put a blob on the drive, saying more about it than its media type: its
+    /// version, where the bytes came from before this room (EXT-5 §5.1), what
+    /// it is to the meeting, and the channel to announce it on. The TypeScript
+    /// SDK's `room.attach(name, data, opts)`.
+    pub async fn attach_with(&self, name: &str, data: &[u8], opts: AttachOptions) -> Result<AttachResult> {
+        self.require_durable()?;
+        let stored = if self.sealed() {
+            sealed::seal_bytes(data, &self.require_room_key()?)?
+        } else {
+            data.to_vec()
+        };
+        let mut req = serde_json::Map::new();
+        req.insert("descriptor".into(), serde_json::to_value(&self.inner.descriptor)?);
+        req.insert("name".into(), json!(name));
+        if let Some(v) = &opts.version {
+            req.insert("version".into(), json!(v));
+        }
+        if let Some(v) = &opts.media_type {
+            req.insert("media_type".into(), json!(v));
+        }
+        if let Some(v) = &opts.origin {
+            req.insert("origin".into(), json!(v));
+        }
+        req.insert("data_b64".into(), json!(B64.encode(&stored)));
+        let resp = self.inner.mesh.service_request(subjects::rooms::ATTACH, Value::Object(req)).await?;
+        let result = AttachResult {
+            ref_: resp.get("ref").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            digest: resp.get("digest").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            size: resp.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+            media_type: resp.get("media_type").and_then(|v| v.as_str()).map(String::from),
+        };
+        self.inner
+            .post(
+                RoomMessage::Artifact {
+                    name: name.to_string(),
+                    version: opts.version.clone().unwrap_or_else(|| "1".to_string()),
+                    ref_: result.ref_.clone(),
+                    digest: result.digest.clone(),
+                    media_type: opts.media_type.clone(),
+                    size: Some(result.size),
+                    sealed: self.sealed(),
+                    origin: opts.origin.clone(),
+                    external: None,
+                    role: opts.role.clone(),
+                },
+                opts.channel.as_deref(),
+            )
+            .await?;
+        Ok(result)
+    }
+
+    /// Announce a file the room does not hold: where it lives and what it
+    /// should hash to (EXT-5 §5.2). The drive takes at most 512 KB a file, so
+    /// a video or a dataset is linked, never stored. The digest is required: a
+    /// pointer with no digest says nothing about what you will get when you
+    /// follow it. Nothing on the mesh fetches the location. The TypeScript
+    /// SDK's `room.link(name, opts)`.
+    pub async fn link(&self, name: &str, opts: LinkOptions) -> Result<LinkResult> {
+        self.require_durable()?;
+        let mut req = serde_json::Map::new();
+        req.insert("descriptor".into(), serde_json::to_value(&self.inner.descriptor)?);
+        req.insert("name".into(), json!(name));
+        if let Some(v) = &opts.version {
+            req.insert("version".into(), json!(v));
+        }
+        if let Some(v) = &opts.media_type {
+            req.insert("media_type".into(), json!(v));
+        }
+        if let Some(v) = &opts.origin {
+            req.insert("origin".into(), json!(v));
+        }
+        req.insert("location".into(), json!(opts.location));
+        req.insert("digest".into(), json!(opts.digest));
+        if let Some(v) = opts.size {
+            req.insert("size".into(), json!(v));
+        }
+        let resp = self.inner.mesh.service_request(subjects::rooms::ATTACH, Value::Object(req)).await?;
+        let result = LinkResult {
+            ref_: resp.get("ref").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            digest: resp.get("digest").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            size: resp.get("size").and_then(|v| v.as_u64()),
+            external: resp.get("external").and_then(|v| v.as_str()).unwrap_or(&opts.location).to_string(),
+        };
+        self.inner
+            .post(
+                RoomMessage::Artifact {
+                    name: name.to_string(),
+                    version: opts.version.clone().unwrap_or_else(|| "1".to_string()),
+                    ref_: result.ref_.clone(),
+                    digest: result.digest.clone(),
+                    media_type: opts.media_type.clone(),
+                    size: result.size,
+                    // Never sealed: the room holds no bytes to seal.
+                    sealed: false,
+                    origin: opts.origin.clone(),
+                    external: Some(result.external.clone()),
+                    role: opts.role.clone(),
+                },
+                opts.channel.as_deref(),
+            )
+            .await?;
+        Ok(result)
+    }
+
+    /// The room's drive index: every file, newest last. Not the transcript:
+    /// the record says a file was announced, this says what is stored and
+    /// still fetchable. The TypeScript SDK's `room.files()`.
+    pub async fn files(&self) -> Result<Vec<RoomFile>> {
+        let s = self.status().await?;
+        let list = s.get("drive").and_then(|d| d.get("artifacts")).cloned().unwrap_or(Value::Array(vec![]));
+        Ok(serde_json::from_value(list)?)
+    }
+
     /// Put a blob on the drive (encrypted in a sealed room) and post the signed
     /// `artifact` announcement.
     pub async fn attach(&self, name: &str, data: &[u8], media_type: Option<&str>) -> Result<AttachResult> {
@@ -1486,6 +1667,7 @@ impl Room {
             digest: resp.get("digest").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             media_type: resp.get("media_type").and_then(|v| v.as_str()).map(String::from),
             size: resp.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+            origin: resp.get("origin").and_then(|v| v.as_str()).map(String::from),
             data,
         })
     }
@@ -1735,6 +1917,9 @@ pub struct MyRoom {
     pub last_seq: Option<u64>,
     #[serde(default)]
     pub cursor: u64,
+    /// The room's signed descriptor, to rejoin it by.
+    #[serde(default)]
+    pub descriptor: Option<RoomDescriptor>,
 }
 
 // ── construction on the client ──────────────────────────────────────────────

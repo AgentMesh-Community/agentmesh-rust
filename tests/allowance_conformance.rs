@@ -90,14 +90,14 @@ fn every_valid_documents_canonical_bytes_reproduce_exactly() {
 }
 
 #[test]
-fn all_seven_signed_vectors_verify() {
+fn every_signed_vector_verifies() {
     // The signature question, judged alone over the raw JSON: every genuinely
-    // signed vector — the three valid documents AND the four shape-invalid
+    // signed vector — the four valid documents (one with a trial ceiling) AND the four shape-invalid
     // ones — verifies, which is what guarantees each invalid case is refused
     // for exactly its single stated reason.
     let f = fixture();
     let vectors = signed_vectors(&f);
-    assert_eq!(vectors.len(), 7, "three valid + four signed invalids");
+    assert_eq!(vectors.len(), 8, "four valid + four signed invalids");
     for (name, doc) in vectors {
         assert!(verify_allowance_signature(&doc), "vector '{name}' must verify");
     }

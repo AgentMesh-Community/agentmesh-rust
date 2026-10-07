@@ -58,6 +58,7 @@ use crate::budget::{budget_insufficient, CostCeiling};
 use crate::error::{ErrorCode, MeshError, Result};
 use crate::identity::{b64url, canonical_json, tagged_sig_bytes, unb64url, verify_tagged};
 use crate::inbound::{inbound_text_length, parse_instant_ms};
+use crate::trial::TrialFunds;
 
 /// The domain tag inside an allowance's signed bytes (EXT-8 §1): the ASCII
 /// prefix, one newline, then the canonical JSON (§5.3) of the document
@@ -99,6 +100,12 @@ pub enum CeilingScope {
     Context,
     /// The UTC calendar day of the metering instant.
     Day,
+    /// Trial work per UTC day (Common Agent 7.5 and 7.7): what the owner
+    /// lets trial requests cost the publisher in one day. Trial spend counts
+    /// against this ceiling AND every wider one (task, context, day);
+    /// ordinary work never counts against it, and it never applies to
+    /// ordinary admission.
+    Trial,
 }
 
 impl CeilingScope {
@@ -107,6 +114,7 @@ impl CeilingScope {
             CeilingScope::Task => "task",
             CeilingScope::Context => "context",
             CeilingScope::Day => "day",
+            CeilingScope::Trial => "trial",
         }
     }
 }
@@ -243,11 +251,11 @@ fn validate_allowance_shape(doc: &Value) -> Result<()> {
             return Err(shape_err("Each allowance ceiling is a JSON object (EXT-8 §1)"));
         };
         match c.get("scope").and_then(Value::as_str) {
-            Some("task") | Some("context") | Some("day") => {}
+            Some("task") | Some("context") | Some("day") | Some("trial") => {}
             other => {
                 return Err(shape_err(format!(
-                    "Allowance ceiling scope {} is not in the closed enum task | context | day \
-                     (EXT-8 §1: an ignored ceiling is an unenforced one)",
+                    "Allowance ceiling scope {} is not in the closed enum task | context | day | \
+                     trial (EXT-8 §1: an ignored ceiling is an unenforced one)",
                     other.map(|s| format!("'{s}'")).unwrap_or_else(|| "(missing)".to_string()),
                 )));
             }
@@ -422,16 +430,35 @@ pub struct SpendLedger {
     by_task: HashMap<String, u64>,
     by_context: HashMap<String, u64>,
     by_day: HashMap<String, u64>,
+    /// Trial spend per UTC day (Common Agent 7.5): a fourth book, kept beside
+    /// the other three rather than instead of them, so the owner's total
+    /// stays the total.
+    by_trial_day: HashMap<String, u64>,
 }
 
 impl SpendLedger {
-    fn record(&mut self, task_id: &str, context_id: Option<&str>, day: &str, cost_micro: u64) {
+    fn record(
+        &mut self,
+        task_id: &str,
+        context_id: Option<&str>,
+        day: &str,
+        cost_micro: u64,
+        trial: bool,
+    ) {
         let add = |slot: &mut u64| *slot = slot.saturating_add(cost_micro);
         add(self.by_task.entry(task_id.to_string()).or_default());
         if let Some(ctx) = context_id {
             add(self.by_context.entry(ctx.to_string()).or_default());
         }
         add(self.by_day.entry(day.to_string()).or_default());
+        if trial {
+            add(self.by_trial_day.entry(day.to_string()).or_default());
+        }
+    }
+
+    /// Micro-units of trial work accounted to a UTC day (`YYYY-MM-DD`).
+    pub fn trial_spend(&self, day: &str) -> u64 {
+        self.by_trial_day.get(day).copied().unwrap_or(0)
     }
 
     /// Micro-units accounted to a Task.
@@ -659,6 +686,33 @@ impl AllowanceMeter {
         day: &str,
         usage: Usage,
     ) -> Result<u64> {
+        self.report_work_at(task_id, context_id, day, usage, false)
+    }
+
+    /// [`report_at`](Self::report_at) for trial work (Common Agent 7.5,
+    /// 7.7): accounted to the Task, its context and the day like any spend,
+    /// and also to the day's trial book, which only the `trial` ceiling
+    /// reads.
+    pub fn report_trial_at(
+        &mut self,
+        task_id: &str,
+        context_id: Option<&str>,
+        day: &str,
+        usage: Usage,
+    ) -> Result<u64> {
+        self.report_work_at(task_id, context_id, day, usage, true)
+    }
+
+    /// The one metering path behind [`report_at`](Self::report_at) and
+    /// [`report_trial_at`](Self::report_trial_at).
+    pub fn report_work_at(
+        &mut self,
+        task_id: &str,
+        context_id: Option<&str>,
+        day: &str,
+        usage: Usage,
+        trial: bool,
+    ) -> Result<u64> {
         let cost_micro = self.usage_micro(usage).ok_or_else(|| {
             MeshError::code(
                 ErrorCode::InvalidEnvelope,
@@ -666,7 +720,7 @@ impl AllowanceMeter {
                  (EXT-8 §1/§2)",
             )
         })?;
-        self.ledger.record(task_id, context_id, day, cost_micro);
+        self.ledger.record(task_id, context_id, day, cost_micro, trial);
         Ok(cost_micro)
     }
 
@@ -724,9 +778,36 @@ impl AllowanceMeter {
             ArmState::Armed(doc) => doc,
         };
 
+        match self.binding_of(doc, work, day, false) {
+            Some(b) if estimate_micro > b.remaining_micro => AllowanceDecision::Exhausted {
+                on_exhausted: doc.on_exhausted,
+                binding: Some(b),
+                estimate: Some(CostCeiling::new(estimate_micro, doc.cost_model.currency.clone())),
+            },
+            binding => AllowanceDecision::Admit { binding },
+        }
+    }
+
+    /// The applicable ceiling with the smallest remaining amount. For
+    /// ordinary work the `trial` ceiling never applies; for trial work it
+    /// applies beside every wider one, so trial work fits only where both
+    /// the trial share and the owner's total have room.
+    fn binding_of(
+        &self,
+        doc: &Allowance,
+        work: WorkScope<'_>,
+        day: &str,
+        trial: bool,
+    ) -> Option<BindingCeiling> {
         let mut binding: Option<BindingCeiling> = None;
         for c in &doc.ceilings {
             let spent_micro = match c.scope {
+                CeilingScope::Trial => {
+                    if !trial {
+                        continue;
+                    }
+                    self.ledger.trial_spend(day)
+                }
                 CeilingScope::Task => {
                     if let Some(narrow) = c.task_id.as_deref() {
                         if work.task_id != Some(narrow) {
@@ -756,15 +837,53 @@ impl AllowanceMeter {
                 });
             }
         }
+        binding
+    }
 
-        match binding {
-            Some(b) if estimate_micro > b.remaining_micro => AllowanceDecision::Exhausted {
-                on_exhausted: doc.on_exhausted,
-                binding: Some(b),
-                estimate: Some(CostCeiling::new(estimate_micro, doc.cost_model.currency.clone())),
-            },
-            binding => AllowanceDecision::Admit { binding },
+    /// The trial ceiling's answer for trial work of `estimate_micro` at UTC
+    /// day `day` (Common Agent 7.5, 7.7):
+    ///
+    /// - [`TrialFunds::None`]: no allowance is armed, or the armed one sets no
+    ///   `trial` ceiling. The node refuses trial work on `funds` rather than
+    ///   spend unbounded.
+    /// - [`TrialFunds::Full`]: the estimate exceeds the remainder of the trial
+    ///   ceiling or of any wider applicable ceiling; also the answer of a
+    ///   fail-closed meter, whose every ceiling reads exhausted.
+    /// - [`TrialFunds::Room`]: it fits under all of them. Landing exactly on a
+    ///   remainder fits, as for ordinary admission.
+    ///
+    /// `ask_owner` does not apply here: a trial is the publisher's gift, and
+    /// a gift that needs the owner's approval each time is not one a host can
+    /// list.
+    pub fn trial_funds_at(&self, work: WorkScope<'_>, estimate_micro: u64, day: &str) -> TrialFunds {
+        let doc = match &self.state {
+            ArmState::Unarmed => return TrialFunds::None,
+            ArmState::FailClosed { .. } => return TrialFunds::Full,
+            ArmState::Armed(doc) => doc,
+        };
+        if !doc.ceilings.iter().any(|c| c.scope == CeilingScope::Trial) {
+            return TrialFunds::None;
         }
+        match self.binding_of(doc, work, day, true) {
+            Some(b) if estimate_micro > b.remaining_micro => TrialFunds::Full,
+            _ => TrialFunds::Room,
+        }
+    }
+
+    /// [`trial_funds_at`](Self::trial_funds_at) against today's UTC day.
+    pub fn trial_funds(&self, work: WorkScope<'_>, estimate_micro: u64) -> TrialFunds {
+        self.trial_funds_at(work, estimate_micro, &today_utc())
+    }
+
+    /// [`report`](Self::report) for trial work: see
+    /// [`report_trial_at`](Self::report_trial_at).
+    pub fn report_trial(
+        &mut self,
+        task_id: &str,
+        context_id: Option<&str>,
+        usage: Usage,
+    ) -> Result<u64> {
+        self.report_trial_at(task_id, context_id, &today_utc(), usage)
     }
 
     /// [`check_admission_at`](Self::check_admission_at) against today's UTC
@@ -832,8 +951,9 @@ mod tests {
     #[test]
     fn one_recording_lands_in_all_three_books() {
         let mut ledger = SpendLedger::default();
-        ledger.record("t1", Some("ctx"), "2026-07-28", 40);
-        ledger.record("t1", None, "2026-07-28", 2);
+        ledger.record("t1", Some("ctx"), "2026-07-28", 40, false);
+        ledger.record("t1", None, "2026-07-28", 2, false);
+        assert_eq!(ledger.trial_spend("2026-07-28"), 0, "ordinary spend never lands in the trial book");
         assert_eq!(ledger.task_spend("t1"), 42);
         assert_eq!(ledger.context_spend("ctx"), 40, "the no-context recording skipped this book");
         assert_eq!(ledger.day_spend("2026-07-28"), 42);
@@ -932,5 +1052,58 @@ mod tests {
             panic!("admitted with a binding ceiling");
         };
         assert_eq!(b.scope, CeilingScope::Task, "equal remainders: document order holds");
+    }
+
+    #[test]
+    fn the_trial_scope_joins_a_closed_enum_that_stays_closed() {
+        let (doc, _) = signed_doc(json!([{ "scope": "trial", "amount_micro": 100 }]), "refuse");
+        assert!(load_allowance(&doc).is_ok(), "trial is a scope");
+        let mut week = doc.clone();
+        week["ceilings"][0]["scope"] = json!("week");
+        let err = validate_allowance_value(&week).unwrap_err().to_string();
+        assert!(err.contains("closed enum"), "{err}");
+    }
+
+    #[test]
+    fn a_trial_ceiling_never_binds_ordinary_work_and_trial_spend_counts_everywhere() {
+        let (doc, _) = signed_doc(
+            json!([
+                { "scope": "day", "amount_micro": 1000 },
+                { "scope": "trial", "amount_micro": 300 }
+            ]),
+            "refuse",
+        );
+        let mut meter = AllowanceMeter::new();
+        meter.arm(&doc).unwrap();
+        let day = "2026-10-05";
+        let work = WorkScope::default();
+        meter.report_trial_at("t1", Some("c"), day, Usage::CostMicro(250)).unwrap();
+        assert_eq!(meter.ledger().trial_spend(day), 250);
+        assert_eq!(meter.ledger().day_spend(day), 250, "trial spend counts toward the day");
+        assert_eq!(meter.ledger().context_spend("c"), 250);
+        assert_eq!(meter.trial_funds_at(work, 50, day), TrialFunds::Room, "lands exactly on 50 left");
+        assert_eq!(meter.trial_funds_at(work, 51, day), TrialFunds::Full);
+        // Ordinary work sees the day ceiling only: 750 left.
+        assert!(matches!(
+            meter.check_admission_at(work, 700, day),
+            AllowanceDecision::Admit { binding: Some(BindingCeiling { scope: CeilingScope::Day, .. }) }
+        ));
+        // Ordinary spend eats the day, so the wider ceiling now binds trials.
+        meter.report_at("t2", None, day, Usage::CostMicro(740)).unwrap();
+        assert_eq!(meter.ledger().trial_spend(day), 250, "ordinary spend never counts as trial");
+        assert_eq!(meter.trial_funds_at(work, 11, day), TrialFunds::Full, "the day has 10 left");
+    }
+
+    #[test]
+    fn trial_funds_are_none_without_a_trial_ceiling_and_full_when_failing_closed() {
+        let mut meter = AllowanceMeter::new();
+        assert_eq!(meter.trial_funds(WorkScope::default(), 0), TrialFunds::None, "no allowance");
+        let (doc, _) = signed_doc(json!([{ "scope": "day", "amount_micro": 1000 }]), "refuse");
+        meter.arm(&doc).unwrap();
+        assert_eq!(meter.trial_funds(WorkScope::default(), 0), TrialFunds::None, "no trial ceiling");
+        let (mut bad, _) = signed_doc(json!([{ "scope": "trial", "amount_micro": 1000 }]), "refuse");
+        bad["updated_at"] = json!("2027-01-01T00:00:00.000Z");
+        assert!(meter.arm(&bad).is_err());
+        assert_eq!(meter.trial_funds(WorkScope::default(), 0), TrialFunds::Full, "fails closed");
     }
 }

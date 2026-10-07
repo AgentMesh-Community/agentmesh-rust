@@ -99,6 +99,14 @@ pub struct Offering {
     /// and never a clause. See [`OfferingReporting`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reporting: Option<OfferingReporting>,
+    /// The offering's trial declaration (Common Agent 7.7): who may ask for
+    /// trial work, its shape, and its counts. Held as raw JSON so a foreign
+    /// manifest with a member this SDK cannot read still deserializes; it is
+    /// read leniently ([`crate::trial::trial_declaration_of`]), so a member
+    /// that does not validate offers no trial. `register` refuses one that
+    /// does not validate. Absent means no trial is offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial: Option<serde_json::Value>,
 }
 
 /// The offered reporting level on an offering (§8.5.2): the level its

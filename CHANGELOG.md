@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.22.0 (2026-10-07)
+
+- Platform services and the mesh's own requests, one method per request:
+  `mesh.<service>().<request>(input)`, made from the same definitions as the
+  TypeScript SDK and the adapter (`platform-services/` in the AgentMesh
+  repository). 100 requests: the platform services (account, agents,
+  attachments, calls, catalog, credits, debt, dependents, errors, jobs,
+  memory, pact, portfolio, runs, samples, schedules, transform) through the
+  platform's service door, signed by the agent's key, and rooms, board,
+  reviews, messages, contacts, owner, identity, names, feeds and registry
+  done on the mesh. A refusal carries a code its request's definition names,
+  and each request has an enum of them. See the README's "Platform services
+  and the mesh's own requests".
+- PACT 1.0 for agent builders, the `pact` module (the same set as the
+  TypeScript SDK's `pact` namespace): `check_delegation` for a business's
+  agent handed a PACT turn on `meta.pact`, `pact_report` and
+  `pact_needs_permission` for its answer, and, for anyone who is their own
+  personal-agent platform, `sign_pa_jwt`, with `send_pact_message` and
+  `fetch_gateway_keys` under the `http` feature. ES256 only. Adds the `p256`
+  dependency.
+- Trials (Common Agent 7.7), as in the TypeScript SDK 0.55.0. The `trial`
+  module validates a declaration, admits in the spec's order (budget first)
+  and refuses with `TRIAL_REFUSED` and its details. A request marked trial
+  passes the trial gate at the node's door before the allowance and
+  agreement steps: the offering's trial declaration (`Offering.trial`), the
+  requester (the sender, or a trusted host's `trial_requester` vouch), counts
+  from a pluggable `TrialLedger` (in memory by default), and funds from the
+  allowance's new `trial` scope. An admitted trial is counted once and the
+  handler gets `RequestContext.trial`. `RequestOptions` gains `trial` and
+  `trial_requester`. `tests/trial_conformance.rs` runs
+  `conformance/trial.json`.
+- The platform's default hosts come from one generated file,
+  `env_generated.rs`, written from the AgentMesh environment file. The
+  published crate names prod's hosts, as before.
+- `ConnectOptions` gains `platform_api`, `platform_key` (the account's token,
+  sent only with an owner's acts), `operator_key` (sent only with an
+  operator's), `service_transport` and `naming_service`. `RequestOptions`
+  gains `context_id`.
+- Rooms: `Room::attach_with` (version, origin, role, channel), `Room::link`
+  for a file held elsewhere, `Room::files` for the drive's index, `origin` on
+  `FetchedArtifact`, and `descriptor` on `MyRoom`, as in the TypeScript SDK.
+- A rooms service refusal whose code the protocol's list does not name (its
+  own `NOT_FOUND`, `QUOTA_EXCEEDED`) now arrives as `MeshError::Refusal` with
+  that code, rather than as `INTERNAL_ERROR`.
+
 ## 0.21.0 (2026-09-28)
 
 - Receivers refuse revoked and paused senders (SPEC 5.3, 4.12). Before a

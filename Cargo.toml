@@ -1,6 +1,6 @@
 [package]
 name = "agentmesh"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 description = "Rust SDK for AgentMesh: signed agent-to-agent messaging over NATS"
 license = "Apache-2.0"
@@ -51,6 +51,9 @@ futures = "0.3"
 crypto_box = { version = "0.9", features = ["salsa20", "std"] }
 crypto_secretbox = { version = "0.1", features = ["std"] }
 sha2 = "0.10"
+# PACT 1.0 (src/pact.rs): ES256, the algorithm AgentMesh's gateway signs
+# delegation tokens and receipts with, and personal-agent JWTs are signed in.
+p256 = { version = "0.13", features = ["ecdsa"] }
 # The built-in `CredentialTransport` (feature `http`, on by default): the one
 # POST §4.8 renewal makes. rustls rather than the platform TLS stack so a build
 # needs no system OpenSSL, and default features off so this brings a TLS client

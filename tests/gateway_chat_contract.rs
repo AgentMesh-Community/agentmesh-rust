@@ -60,7 +60,7 @@ async fn gateway_chat_offering_contract() {
                 output_modes: None,
                 streaming: None,
                 needs: None,
-                delivers: None, reporting: None,
+                delivers: None, reporting: None, trial: None,
             }],
             ..Default::default()
         })

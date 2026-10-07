@@ -1058,12 +1058,12 @@ mod tests {
     #[test]
     fn the_endpoint_trims_exactly_one_trailing_slash() {
         assert_eq!(
-            credential_endpoint("https://api.agentmesh.ai"),
-            "https://api.agentmesh.ai/v1/node-credential"
+            credential_endpoint("https://mesh.example"),
+            "https://mesh.example/v1/node-credential"
         );
         assert_eq!(
-            credential_endpoint("https://api.agentmesh.ai/"),
-            "https://api.agentmesh.ai/v1/node-credential"
+            credential_endpoint("https://mesh.example/"),
+            "https://mesh.example/v1/node-credential"
         );
     }
 

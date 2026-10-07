@@ -177,7 +177,7 @@ async fn main() {
                                 output_modes: None,
                                 streaming: None,
                 needs: None,
-                delivers: None, reporting: None,
+                delivers: None, reporting: None, trial: None,
                             })
                             .collect()
                     })

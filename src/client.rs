@@ -41,9 +41,14 @@ use crate::inbound::{
     SeenEnvelopes,
 };
 use crate::manifest::{Manifest, NodeRef, Offering, PublicBlock};
-use crate::sku::{public_sku_of, sku_digest, sku_for, validate_skus, Sku, SkuPriceModel};
+use crate::sku::{public_sku_of, sku_digest, sku_for, validate_skus, Sku, SkuPrice, SkuPriceModel};
 use crate::revoked_senders::{RevocationAnswer, RevokedSenders};
 use crate::subjects;
+use crate::trial::{
+    is_trial_request, quote_from_price, trial_admission, trial_declaration_of,
+    trial_requester_of, validate_trial, work_caps, MemoryTrialLedger, TrialAdmissionArgs,
+    TrialContext, TrialLedger, TrialRequester, TrialRequesterKind, TrialWho,
+};
 use crate::util::child_span;
 use crate::vouch::{
     vouch_check_interval, vouch_renew_at, VouchStatus, DEFAULT_VOUCH_TTL_MS,
@@ -239,6 +244,26 @@ pub struct ConnectOptions {
     /// sends without a verified name is refused by the platform as well. The
     /// TypeScript SDK's `requireNamed: false`.
     pub allow_unnamed: bool,
+    /// The platform's API, where `mesh.<service>()` sends a platform service's
+    /// requests (`crate::services`). This environment's when `None`. The
+    /// TypeScript SDK's `platformApi`.
+    pub platform_api: Option<String>,
+    /// The account's API token, sent beside the agent's signature with an
+    /// owner's acts (credits, attachments, portfolio), which need it with the
+    /// request's scope. The agent's other requests carry its signature alone.
+    /// The TypeScript SDK's `platformKey`.
+    pub platform_key: Option<String>,
+    /// An operator key, sent with the requests only an operator may make (the
+    /// Unified Error Log, filing and moving debt). The adapter's
+    /// `AGENTMESH_SERVICE_KEY`.
+    pub operator_key: Option<String>,
+    /// How platform service requests are sent. The built-in HTTPS client when
+    /// `None` (feature `http`).
+    pub service_transport: Option<Arc<dyn crate::services::ServiceTransport>>,
+    /// The naming service the SDK's requests resolve handles at
+    /// (`mesh.rooms().invite`, `mesh.reviews().file` and the others that take a
+    /// handle). This environment's when `None`.
+    pub naming_service: Option<String>,
 }
 
 /// Connect to NATS, with JWT + nkey nonce-signing auth when a JWT is provided
@@ -515,6 +540,18 @@ pub struct RequestOptions {
     /// recipient declared. `Some(false)` sends in the clear, and a recipient
     /// declaring `required` will refuse it.
     pub seal: Option<bool>,
+    /// Ask for trial work (Common Agent 7.7): the request carries
+    /// `trial: true`. A trial carries no budget; one sent with `budget` is
+    /// refused `TRIAL_REFUSED` with reason `budget`.
+    pub trial: bool,
+    /// For a host sending a trial on someone's behalf: who is really asking
+    /// (a visitor under a host-issued id, or an account). Carried as
+    /// `trial_requester`; believed only by a responder that trusts this
+    /// sender as a host.
+    pub trial_requester: Option<TrialRequester>,
+    /// The conversation this request belongs to: the envelope's
+    /// `context_id`. The TypeScript SDK's `context_id` request option.
+    pub context_id: Option<String>,
 }
 
 /// The result of a `request`.
@@ -775,6 +812,12 @@ pub struct RequestContext {
     /// [`crate::budget::deadline_unmeetable`] rather than accepting and
     /// failing mid-flight.
     pub budget: Option<Budget>,
+    /// Set when this request is an admitted trial (Common Agent 7.7): who
+    /// asked, the shape the work must keep to (fewer outputs, a mark, a
+    /// shorter keep), and the caps only the work can measure (pages,
+    /// seconds, items). `None` for ordinary work. The requester owes
+    /// nothing; usage reported for it is metered as trial spend.
+    pub trial: Option<crate::trial::TrialContext>,
 }
 
 /// Per-offering handler settings ([`AgentMesh::set_handler_options`]).
@@ -968,6 +1011,9 @@ struct Inner {
     /// §19 commerce state: the registered SKUs and their digests, the held
     /// agreements, and the caches the §19.5 admission check runs on.
     commerce: CommerceState,
+    /// Common Agent 7.7 trial state: the count ledger and the hosts whose
+    /// `trial_requester` vouch this agent believes.
+    trials: TrialState,
     /// The [`RegisterOptions`] this agent last registered with — the input a
     /// §4.4 vouch renewal rebuilds the manifest from. `None` until `register`.
     register_opts: std::sync::Mutex<Option<RegisterOptions>>,
@@ -1013,6 +1059,9 @@ struct Inner {
     /// with `require_named`, and then every send this agent originates asks it
     /// first.
     naming_gate: Option<Arc<crate::naming_gate::NamingGate>>,
+    /// How this agent reaches the platform's services, and the rooms the
+    /// rooms door holds ([`crate::services`]).
+    pub(crate) platform: crate::services::PlatformState,
 }
 
 /// The §4.4 renewal state one agent carries (mirrors the TS SDK's
@@ -1027,6 +1076,28 @@ struct VouchState {
     renew_at_ms: Option<i64>,
     /// Why the last renewal attempt failed. Cleared by the next success.
     last_error: Option<String>,
+}
+
+/// The Common Agent 7.7 trial state one agent carries.
+struct TrialState {
+    /// Where admitted trials are counted. Default: in memory.
+    ledger: RwLock<Arc<dyn TrialLedger>>,
+    /// Sender keys trusted as hosts: a `trial_requester` vouch is believed
+    /// only from one of these. From anyone else the requester is the sender.
+    hosts: RwLock<std::collections::HashSet<String>>,
+    /// Held across read-counts, judge, record, so two trial requests arriving
+    /// together cannot both take the last count.
+    gate: std::sync::Mutex<()>,
+}
+
+impl Default for TrialState {
+    fn default() -> Self {
+        TrialState {
+            ledger: RwLock::new(Arc::new(MemoryTrialLedger::new())),
+            hosts: RwLock::new(std::collections::HashSet::new()),
+            gate: std::sync::Mutex::new(()),
+        }
+    }
 }
 
 /// The §19 commerce state one agent carries (mirrors the TS SDK's fields):
@@ -1258,6 +1329,16 @@ pub struct AgentMesh {
     inner: Arc<Inner>,
 }
 
+/// An [`AgentMesh`] that does not keep the agent alive.
+#[derive(Clone)]
+pub(crate) struct WeakAgentMesh(std::sync::Weak<Inner>);
+
+impl WeakAgentMesh {
+    pub(crate) fn upgrade(&self) -> Option<AgentMesh> {
+        self.0.upgrade().map(|inner| AgentMesh { inner })
+    }
+}
+
 impl AgentMesh {
     /// Connect. The agent always has an Ed25519 keypair (its public nkey is the
     /// agent ID) and signs every envelope; a node key vouches for it (§4.4).
@@ -1320,6 +1401,7 @@ impl AgentMesh {
                 interaction: std::sync::Mutex::new(None),
                 sealing: std::sync::Mutex::new(None),
                 commerce: CommerceState::default(),
+                trials: TrialState::default(),
                 register_opts: std::sync::Mutex::new(None),
                 vouch: std::sync::Mutex::new(VouchState::default()),
                 vouch_in_flight: std::sync::atomic::AtomicBool::new(false),
@@ -1337,6 +1419,7 @@ impl AgentMesh {
                         .or_else(crate::naming_gate::RequireNamed::by_default)
                         .map(|cfg| Arc::new(crate::naming_gate::NamingGate::new(agent_id_for_gate.clone(), cfg)))
                 },
+                platform: crate::services::PlatformState::new(opts.platform_api, opts.platform_key, opts.operator_key, opts.service_transport, opts.naming_service),
             }),
         };
 
@@ -1367,6 +1450,16 @@ impl AgentMesh {
         let gate = self.inner.naming_gate.as_ref()?;
         gate.forget();
         Some(gate.check().await)
+    }
+
+    /// How this agent reaches the platform's services ([`crate::services`]).
+    pub(crate) fn platform(&self) -> &crate::services::PlatformState {
+        &self.inner.platform
+    }
+
+    /// A handle that does not keep this agent alive.
+    pub(crate) fn downgrade(&self) -> WeakAgentMesh {
+        WeakAgentMesh(Arc::downgrade(&self.inner))
     }
 
     /// The naming rule's check, run first by every send this agent originates.
@@ -1499,6 +1592,7 @@ impl AgentMesh {
                 interaction: std::sync::Mutex::new(None),
                 sealing: std::sync::Mutex::new(None),
                 commerce: CommerceState::default(),
+                trials: TrialState::default(),
                 register_opts: std::sync::Mutex::new(None),
                 vouch: std::sync::Mutex::new(VouchState::default()),
                 vouch_in_flight: std::sync::atomic::AtomicBool::new(false),
@@ -1515,6 +1609,9 @@ impl AgentMesh {
                 // built by its node, which does not carry the option (the TS
                 // SDK's addAgent does not either).
                 naming_gate: None,
+                // This environment's platform, with no key: a hosted agent
+                // signs its own service requests.
+                platform: crate::services::PlatformState::new(None, None, None, None, None),
             }),
         })
     }
@@ -1664,6 +1761,33 @@ impl AgentMesh {
         self
     }
 
+    // ── Common Agent 7.7 trials ──
+
+    /// Count admitted trials in `ledger` instead of the default in-memory
+    /// one: a node that restarts and must not hand out a requester's trials
+    /// again keeps its counts in a file or a database behind
+    /// [`TrialLedger`]. Counts already in the old ledger are not carried over.
+    pub fn set_trial_ledger(&self, ledger: Arc<dyn TrialLedger>) -> &Self {
+        *self.inner.trials.ledger.write().unwrap() = ledger;
+        self
+    }
+
+    /// Trust `host_key` (an agent public key) as a host that lists agents and
+    /// sends trial requests for people (Common Agent 7.7 Hosts): its
+    /// `trial_requester` vouch names who is really asking, a visitor among
+    /// them. A vouch from any other sender is ignored and the requester is
+    /// the sender.
+    pub fn trust_trial_host(&self, host_key: &str) -> &Self {
+        self.inner.trials.hosts.write().unwrap().insert(host_key.to_string());
+        self
+    }
+
+    /// Stop trusting `host_key`'s `trial_requester` vouch.
+    pub fn untrust_trial_host(&self, host_key: &str) -> &Self {
+        self.inner.trials.hosts.write().unwrap().remove(host_key);
+        self
+    }
+
     // ── §19.5 agreements ──
 
     /// Supply the host's own agreement lookup (§19.5): fetch a consumer
@@ -1706,7 +1830,24 @@ impl AgentMesh {
                  explicit task id",
             )
         })?;
+        // Common Agent 7.5: an admitted trial's spend lands in the trial book
+        // too, so the trial ceiling sees it beside every wider one.
+        if dispatch.trial {
+            return self.report_trial_task_usage(&dispatch.task_id, dispatch.context_id.as_deref(), usage);
+        }
         self.report_task_usage(&dispatch.task_id, dispatch.context_id.as_deref(), usage)
+    }
+
+    /// [`report_task_usage`](Self::report_task_usage) for trial work done
+    /// outside a dispatched handler: accounted to the Task, its context and
+    /// the day like any spend, and to the day's trial book (Common Agent 7.5).
+    pub fn report_trial_task_usage(
+        &self,
+        task_id: &str,
+        context_id: Option<&str>,
+        usage: Usage,
+    ) -> Result<u64> {
+        self.inner.allowance.lock().unwrap().report_trial(task_id, context_id, usage)
     }
 
     /// Report model usage against an explicit Task (and optionally its
@@ -1990,6 +2131,19 @@ impl AgentMesh {
     pub(crate) fn record_declared_feed(&self, topic: String, kind: crate::feed::FeedKind) {
         self.inner.declared_feeds.lock().unwrap().insert(topic, kind);
     }
+    /// The declared feeds, by topic (`mesh.feeds().list`).
+    pub(crate) fn declared_feeds(&self) -> Vec<(String, crate::feed::FeedKind)> {
+        self.inner.declared_feeds.lock().unwrap().iter().map(|(t, k)| (t.clone(), *k)).collect()
+    }
+    /// Drop a declaration (`mesh.feeds().retire`): it leaves the manifest at
+    /// the next registration. Whether there was one to drop.
+    pub(crate) fn forget_declared_feed(&self, topic: &str) -> bool {
+        self.inner.declared_feeds.lock().unwrap().remove(topic).is_some()
+    }
+    /// Whether this agent has registered in this process.
+    pub(crate) fn has_registered(&self) -> bool {
+        self.inner.register_opts.lock().unwrap().is_some()
+    }
     /// The declared feeds as manifest `emits` subjects (§8.2), sorted — the
     /// BTreeMap's topic order, which under one shared prefix is subject order.
     pub(crate) fn declared_feed_subjects(&self) -> Vec<String> {
@@ -2016,6 +2170,13 @@ impl AgentMesh {
         .map_err(|e| MeshError::Transport(e.to_string()))?;
         let resp_env = codec::decode(&resp.payload)?;
         if let Some(err) = &resp_env.error {
+            // A service's own codes (the rooms service's NOT_FOUND and
+            // QUOTA_EXCEEDED) are kept as they came, rather than read as an
+            // internal error because the protocol's list does not name them:
+            // the requests in `crate::services` answer with them.
+            if MeshError::from_error_object(err).is_unknown_code() && err.code != ErrorCode::Internal.as_str() {
+                return Err(MeshError::Refusal(err.clone()));
+            }
             return Err(MeshError::from_error_object(err));
         }
         Ok(resp_env.payload.unwrap_or(Value::Null))
@@ -2274,6 +2435,17 @@ impl AgentMesh {
         // can see it — not at some later discovery read.
         if let Some(skus) = opts.skus.as_ref() {
             validate_skus(&serde_json::to_value(skus)?)?;
+        }
+        // Common Agent 7.7: a registry MUST refuse a trial with no count, and
+        // a declaration this agent would read as no trial at its own door is
+        // better refused here, where the operator sees it.
+        for o in &opts.offerings {
+            if let Some(why) = o.trial.as_ref().and_then(|t| validate_trial(t, None)) {
+                return Err(MeshError::code(
+                    ErrorCode::InvalidManifest,
+                    format!("offering {}: {why}", o.id),
+                ));
+            }
         }
         // §19.5: cache each SKU's current digest — the identity an agreement
         // binds to, recomputed only when a registration changes the terms.
@@ -2948,10 +3120,19 @@ impl AgentMesh {
         if let Some(accepted) = &opts.accepted_output {
             payload["config"] = json!({ "accepted_output": accepted });
         }
+        if opts.trial {
+            payload["trial"] = json!(true);
+            if let Some(r) = &opts.trial_requester {
+                payload["trial_requester"] = serde_json::to_value(r)?;
+            }
+        }
         let mut env = Envelope::new(PrimitiveType::Request, &self.inner.agent_id);
         env.to = Some(agent_id.to_string());
         env.payload = Some(payload);
         env.budget = opts.budget.clone();
+        if opts.context_id.is_some() {
+            env.context_id = opts.context_id.clone();
+        }
         self.inner.sign(&mut env);
         let bytes = codec::encode(&env)?;
 
@@ -4121,6 +4302,9 @@ impl AgentMesh {
         // §4.8: nor does the credential loop outlive the connection it keeps
         // usable.
         self.stop_credential_renewal();
+        // The rooms door's live rooms each hold this agent; letting go of them
+        // here is what lets the agent itself be dropped.
+        self.inner.platform.rooms.lock().unwrap().clear();
         for handle in self.inner.tasks.lock().unwrap().drain(..) {
             handle.abort();
         }
@@ -4949,6 +5133,123 @@ fn allowance_admission(
     }
 }
 
+/// The Common Agent 7.7 trial gate for one request marked `trial: true`,
+/// SDK-automatic and run before the allowance and agreement judgements.
+/// `Ok` admits and has already counted the trial (never undone: a trial that
+/// fails after admission stays counted); `Err` is the `TRIAL_REFUSED`
+/// refusal, answered instead of an accept, and nothing is counted.
+///
+/// - The declaration is the registered offering's `trial`, read leniently.
+/// - The requester is the sender, an agent, signed in when the registry
+///   names its owner (asked only when `who` needs it); a host this agent
+///   trusts ([`AgentMesh::trust_trial_host`]) may name someone else with a
+///   `trial_requester` vouch. Verification under the binding is not
+///   something this node can see, so a sender is never `verified` unless a
+///   trusted host says so.
+/// - Funds are the allowance's trial ceiling: no allowance, or none set,
+///   refuses on `funds`.
+/// - The quote is the SKU covering the offering; an uncovered offering is
+///   free (§7.6).
+async fn trial_gate(
+    inner: &Arc<Inner>,
+    env: &Envelope,
+    payload: &Value,
+    input: &Value,
+    ctx: &RequestContext,
+    offering: &str,
+) -> std::result::Result<TrialContext, MeshError> {
+    let (decl, agent_name) = {
+        let opts = inner.register_opts.lock().unwrap();
+        let decl = opts.as_ref().and_then(|o| {
+            o.offerings
+                .iter()
+                .find(|x| x.id == offering)
+                .and_then(|x| x.trial.as_ref())
+                .and_then(trial_declaration_of)
+        });
+        let name = opts.as_ref().map(|o| o.name.clone()).filter(|n| !n.is_empty());
+        (decl, name)
+    };
+    let has_budget = env.budget.is_some();
+
+    let vouched = if inner.trials.hosts.read().unwrap().contains(&env.from) {
+        trial_requester_of(payload)
+    } else {
+        None
+    };
+    let requester = match vouched {
+        Some(r) => r,
+        None => {
+            let needs_account =
+                !has_budget && decl.as_ref().is_some_and(|d| d.who != TrialWho::Anyone);
+            let signed_in = needs_account && consumer_owner(inner, &env.from).await.is_some();
+            TrialRequester {
+                id: env.from.clone(),
+                kind: TrialRequesterKind::Agent,
+                signed_in,
+                verified: false,
+            }
+        }
+    };
+
+    let quote = {
+        let skus = inner.commerce.skus.lock().unwrap();
+        match sku_for(skus.as_deref(), offering) {
+            Some(sku) => quote_from_price(Some(&sku.price)),
+            None => quote_from_price(Some(&SkuPrice {
+                model: SkuPriceModel::Free,
+                currency: None,
+                amount_micro: None,
+                meter: None,
+                per: None,
+                size: None,
+                period: None,
+                tiers: None,
+                included: None,
+            })),
+        }
+    };
+
+    // The estimator hook is host code: never under the meter's lock.
+    let enforcing = inner.allowance.lock().unwrap().enforcing();
+    let estimate = if enforcing {
+        Some(match inner.cost_estimator.read().unwrap().clone() {
+            Some(estimator) => estimator(input, ctx),
+            None => Usage::Tokens(estimate_tokens(input)),
+        })
+    } else {
+        None
+    };
+    let funds = {
+        let meter = inner.allowance.lock().unwrap();
+        let estimate_micro = estimate.and_then(|u| meter.usage_micro(u)).unwrap_or(0);
+        meter.trial_funds(
+            WorkScope { task_id: env.task_id.as_deref(), context_id: env.context_id.as_deref() },
+            estimate_micro,
+        )
+    };
+
+    let ledger = inner.trials.ledger.read().unwrap().clone();
+    let now = chrono::Utc::now();
+    let _gate = inner.trials.gate.lock().unwrap();
+    let counts = ledger.counts(&requester.id, offering, now);
+    trial_admission(TrialAdmissionArgs {
+        trial: decl.as_ref(),
+        has_budget,
+        requester: &requester,
+        inputs: input,
+        counts,
+        funds,
+        quote: &quote,
+        now,
+        agent_name: agent_name.as_deref(),
+    })
+    .map_err(|r| r.to_error())?;
+    ledger.record(&requester.id, offering, now);
+    let decl = decl.expect("admitted only with a declaration");
+    Ok(TrialContext { requester, caps: work_caps(decl.shape.as_ref()), shape: decl.shape })
+}
+
 /// The §19.5 agreement check — SDK-automatic whenever a paid SKU covers the
 /// requested offering, run in the same admission slot as the allowance and
 /// BEFORE any work. `None` admits; `Some` is the `AGREEMENT_REQUIRED` refusal
@@ -5526,14 +5827,31 @@ async fn dispatch_inbound(
     // the offering's registered admission judgement (`on_admission`), which is
     // where budget-side refuse-with-estimate lives — it holds the estimate,
     // the SDK does not.
-    let ctx = RequestContext {
+    //
+    // A request marked `trial: true` (Common Agent 7.7) passes the trial gate
+    // first instead: its budget check comes before everything, its funds are
+    // the allowance's trial ceiling (judged beside every wider ceiling, so the
+    // ordinary allowance judgement has nothing left to add), and the
+    // requester owes nothing, so no agreement is asked for. The offering's
+    // own judgement still runs, with the trial in its context.
+    let mut ctx = RequestContext {
         from: env.from.clone(),
         request_id: env.id.clone(),
         task_id: env.task_id.clone(),
         trace: env.trace.clone(),
         budget: env.budget.clone(),
+        trial: None,
     };
-    let mut admission_refusal: Option<MeshError> = {
+    let is_trial = is_trial_request(&payload);
+    let mut admission_refusal: Option<MeshError> = if is_trial {
+        match trial_gate(&inner, &env, &payload, &input, &ctx, &offering).await {
+            Ok(t) => {
+                ctx.trial = Some(t);
+                None
+            }
+            Err(refusal) => Some(refusal),
+        }
+    } else {
         let deadline_past = env
             .budget
             .as_ref()
@@ -5555,9 +5873,10 @@ async fn dispatch_inbound(
     // 1b. The §19.5 agreement — has this consumer's ACCOUNT accepted the
     //     terms of the paid SKU covering this offering? Free offerings never
     //     reach it, and its refusal is a refusal of admission like the rest.
-    if admission_refusal.is_none() {
+    if admission_refusal.is_none() && !is_trial {
         admission_refusal = agreement_admission(&inner, &env, &offering).await;
     }
+    let trial_ctx = ctx.trial.clone();
     if admission_refusal.is_none() {
         let admit = inner.admissions.read().unwrap().get(&offering).cloned();
         if let Some(admit) = admit {
@@ -5696,6 +6015,7 @@ async fn dispatch_inbound(
             task_id: env.task_id.clone(),
             trace: env.trace.clone(),
             budget: env.budget.clone(),
+            trial: trial_ctx.clone(),
         };
         // §10.8: the dispatch context is ambient while the handler runs, so
         // sub-requests it issues are recorded as delegations of this task.
@@ -5705,6 +6025,7 @@ async fn dispatch_inbound(
             task_id: writer.task_id().to_string(),
             context_id: env.context_id.clone(),
             offering: offering.clone(),
+            trial: trial_ctx.is_some(),
         };
         match crate::util::CURRENT_DISPATCH
             .scope(
@@ -5735,6 +6056,7 @@ async fn dispatch_inbound(
         task_id: env.task_id.clone(),
         trace: env.trace.clone(),
         budget: env.budget.clone(),
+        trial: trial_ctx.clone(),
     };
     let resp = match handler {
         None => inner.error_resp(&env, ErrorCode::OfferingNotFound, format!("No handler registered for offering '{offering}'")),
@@ -5752,6 +6074,7 @@ async fn dispatch_inbound(
                 task_id: dispatch_task_id.clone(),
                 context_id: env.context_id.clone(),
                 offering: offering.clone(),
+                trial: trial_ctx.is_some(),
             };
             // The consumer half of the hop (§13.1.1), parented under the
             // sender's span by carrying the inbound envelope's own trace.

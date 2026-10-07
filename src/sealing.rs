@@ -123,7 +123,7 @@ mod tests {
             streaming: None,
             needs: Some(needs),
             delivers: None,
-            reporting: None,
+            reporting: None, trial: None,
         }
     }
 

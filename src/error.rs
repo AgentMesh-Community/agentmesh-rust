@@ -54,6 +54,14 @@ pub enum ErrorCode {
     /// `approval_url` where a human accepts the terms; see
     /// [`crate::agreement::agreement_required`].
     AgreementRequired,
+    /// Common Agent 7.7: refused at admission, a request marked `trial: true`
+    /// that the trial declaration does not allow. `details` carries `reason`
+    /// (budget, not_offered, not_eligible, input, requester_day, day,
+    /// requester_ever, funds), `limit` and `resets_at` where they apply, and
+    /// `quote`, what the same work costs as an ordinary request; see
+    /// [`crate::trial::trial_refused`]. Never retryable as sent: waiting
+    /// helps only where `resets_at` says so.
+    TrialRefused,
     Internal,
     /// The accumulated context exceeds the agent's capacity. The §22.5 inbound
     /// size cap is the one §22 protection that MUST answer the sender, because
@@ -110,6 +118,7 @@ impl ErrorCode {
             ErrorCode::BudgetExhausted => "BUDGET_EXHAUSTED",
             ErrorCode::DeadlineExceeded => "DEADLINE_EXCEEDED",
             ErrorCode::AgreementRequired => "AGREEMENT_REQUIRED",
+            ErrorCode::TrialRefused => "TRIAL_REFUSED",
             ErrorCode::Internal => "INTERNAL_ERROR",
             ErrorCode::ContextTooLarge => "CONTEXT_TOO_LARGE",
             ErrorCode::ContentTypeNotSupported => "CONTENT_TYPE_NOT_SUPPORTED",
@@ -172,7 +181,7 @@ impl MeshError {
     /// wherever the refusal happened. Everything else keeps the older
     /// code+message shape.
     pub fn from_error_object(e: &ErrorObject) -> Self {
-        const STRUCTURED_REFUSALS: [ErrorCode; 6] = [
+        const STRUCTURED_REFUSALS: [ErrorCode; 7] = [
             ErrorCode::BudgetInsufficient,
             ErrorCode::DeadlineUnmeetable,
             ErrorCode::BudgetExhausted,
@@ -181,6 +190,9 @@ impl MeshError {
             // §19.5: the refusal's details carry the sku, its digest and the
             // approval_url — the one thing a refused buyer needed to act.
             ErrorCode::AgreementRequired,
+            // Common Agent 7.7: the details carry the reason, limit,
+            // resets_at and the quote for the ordinary request.
+            ErrorCode::TrialRefused,
         ];
         if STRUCTURED_REFUSALS.iter().any(|c| c.as_str() == e.code) {
             return MeshError::Refusal(e.clone());
@@ -188,6 +200,23 @@ impl MeshError {
         MeshError::Protocol {
             code: static_code(&e.code),
             message: e.message.clone(),
+        }
+    }
+
+    /// Whether this is a protocol error whose wire code the protocol's list
+    /// did not name, so it was read as `INTERNAL_ERROR`.
+    pub(crate) fn is_unknown_code(&self) -> bool {
+        matches!(self, MeshError::Protocol { code: "INTERNAL_ERROR", .. })
+    }
+
+    /// The error's code as a string: the protocol's, the refusal's, or
+    /// `TRANSPORT` when nothing answered. Empty for the rest.
+    pub fn code_str(&self) -> &str {
+        match self {
+            MeshError::Protocol { code, .. } => code,
+            MeshError::Refusal(e) => &e.code,
+            MeshError::Transport(_) => "TRANSPORT",
+            _ => "",
         }
     }
 
@@ -219,7 +248,7 @@ fn static_code(code: &str) -> &'static str {
         ErrorCode::SealingRequired, ErrorCode::BoardItemTaken,
         ErrorCode::Internal, ErrorCode::ContextTooLarge, ErrorCode::BudgetInsufficient,
         ErrorCode::DeadlineUnmeetable, ErrorCode::BudgetExhausted, ErrorCode::DeadlineExceeded,
-        ErrorCode::AgreementRequired,
+        ErrorCode::AgreementRequired, ErrorCode::TrialRefused,
     ] {
         if c.as_str() == code {
             return c.as_str();

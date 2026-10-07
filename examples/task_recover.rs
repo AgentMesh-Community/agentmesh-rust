@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_modes: None,
                 streaming: Some(true),
                 needs: None,
-                delivers: None, reporting: None,
+                delivers: None, reporting: None, trial: None,
             }],
             ..Default::default()
         })

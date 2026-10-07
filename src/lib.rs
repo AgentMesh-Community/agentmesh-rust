@@ -109,6 +109,7 @@ pub mod cancel;
 pub mod client;
 pub mod codec;
 pub mod credential;
+mod env_generated;
 pub mod envelope;
 pub mod error;
 pub mod feed;
@@ -121,17 +122,22 @@ pub mod manifest;
 pub mod metering;
 pub mod naming_gate;
 pub mod node;
+pub mod pact;
 pub mod preflight;
 pub mod presence;
 pub mod rests_on;
 pub mod revoked_senders;
 pub mod rooms;
 pub mod sealed;
+pub mod services;
+mod services_generated;
+mod mesh_doors;
 pub mod sealing;
 pub mod sku;
 pub mod sow;
 pub mod spans;
 pub mod subjects;
+pub mod trial;
 pub mod util;
 pub mod vouch;
 
@@ -248,8 +254,8 @@ pub use preflight::{
 pub use presence::{NodePresence, PresenceTracker, PRESENCE_STALE_AFTER_MS};
 pub use rooms::{
     descriptor_from_token, descriptor_to_token, normalize_playbook, sign_descriptor,
-    verify_descriptor, AttachResult, BoardItem, BoardItemClaim, BoardList, FetchedArtifact,
-    JoinRoomOptions, NoteSource, NoteVerdict, OpenRoomOptions, PostWorkInput, RecordEntry, Room,
+    verify_descriptor, AttachOptions, AttachResult, BoardItem, BoardItemClaim, BoardList, FetchedArtifact,
+    JoinRoomOptions, LinkOptions, LinkResult, MyRoom, RoomFile, NoteSource, NoteVerdict, OpenRoomOptions, PostWorkInput, RecordEntry, Room,
     RoomDescriptor, RoomInput, RoomMessage, RoomNote, RoomPhase, RoomPlaybook, MAX_ROOM_AGENDA,
     ROOM_DESCRIPTOR_SIG_PREFIX,
 };
@@ -323,6 +329,16 @@ pub use sow::{
     SOW_DISPUTES_POSTURES, SOW_END_STATES, SOW_FLOOR_REMEDIES,
     SOW_QUALIFICATION_KINDS, SOW_REPORTING_GRADE, SOW_REPORTING_LEVELS,
     SOW_SIG_PREFIX, SOW_SUBCONTRACTING_POSTURES,
+};
+pub use trial::{
+    input_over_limit, is_trial_request, money_words, next_utc_midnight, quote_from_price,
+    trial_admission, trial_day_of, trial_declaration_of, trial_of, trial_refusal,
+    trial_refusal_words, trial_refused, trial_requester_of, validate_descriptor_trials,
+    validate_trial, work_caps, InputOver, MemoryTrialLedger, TrialAdmissionArgs, TrialContext,
+    TrialCounts, TrialDeclaration, TrialFunds, TrialInputLimit, TrialInputLimitValue, TrialLedger,
+    TrialLimits, TrialQuote, TrialReason, TrialRefusal, TrialRefusalDetails, TrialRequester,
+    TrialRequesterKind, TrialShape, TrialWho, WorkCap, ADMISSION_LIMIT_KEYS, TRIAL_LIMIT_KEYS,
+    TRIAL_REASONS, TRIAL_WHO,
 };
 pub use vouch::{
     vouch_check_interval, vouch_renew_at, VouchStatus, DEFAULT_VOUCH_TTL_MS,

@@ -129,6 +129,9 @@ pub(crate) struct DispatchContext {
     /// context (EXT-8 §2) without the handler naming it.
     pub context_id: Option<String>,
     pub offering: String,
+    /// An admitted trial (Common Agent 7.7): usage the handler reports is
+    /// metered as trial spend.
+    pub trial: bool,
 }
 
 tokio::task_local! {

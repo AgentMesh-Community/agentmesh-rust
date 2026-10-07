@@ -46,7 +46,7 @@ pub const NAMED_TTL_MS: i64 = 30 * 60_000;
 /// sends at once.
 pub const UNNAMED_TTL_MS: i64 = 5_000;
 
-const DEFAULT_REGISTRAR: &str = "https://naming.agentmesh.ai";
+const DEFAULT_REGISTRAR: &str = crate::env_generated::AM_URL_NAMING;
 
 fn bad_char(c: char) -> bool {
     c.is_whitespace() || c == '@'
